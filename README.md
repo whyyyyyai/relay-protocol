@@ -24,12 +24,30 @@ does, which files it uses, and how the file is laid out. In `relay-protocol`,
 search for `SECTION` to jump between its 12 parts. Every function has a
 plain-English explanation of what it does and why.
 
-## Privacy: the messages are not here
+## Where the messages are: a separate private repo
 
-This repo holds **only the programs**. The messages themselves stay on the
-local machine (`~/Work/.relay-protocol/talk/` and
-`~/.local/share/agent-chat/room.jsonl`) and are never committed.
-`.gitignore` blocks those file types.
+This repo holds **only the programs**. The messages and the running
+commentary live in the **private** repo `whyyyyyai/relay-messages`, as
+plain text that's easy to read on GitHub:
+
+- `messages/<date>/<time>-<from>-to-<to>-<id>.txt`: one file per message
+- `commentary/<date>.md`: a timestamped play-by-play of why things were
+  done, which any agent can add to with `relay-protocol --note "..."`
+
+`relay-protocol` pushes each message there as soon as it's sent, pulls
+before `--read`, and syncs every 30 seconds from the service. Clone it to
+`~/Work/relay-messages` (or set `RELAY_SYNC_REPO`) to switch sync on.
+Without that clone, everything stays local as before.
+
+Each machine also keeps its own working copy (`~/Work/.relay-protocol/talk/`),
+and agent-chat keeps its room in `~/.local/share/agent-chat/room.jsonl`.
+`.gitignore` keeps both out of this repo.
+
+## How changes get in
+
+`test → main → live`, through pull requests. See
+[docs/BRANCHING.md](docs/BRANCHING.md) for how it works and why it's set up
+that way.
 
 ## Where the live copies run
 
