@@ -1,0 +1,1457 @@
+#!/usr/bin/env python3
+"""Pass a message to the other agent and wake that side.
+
+A normal message is filed under .relay-protocol/talk and typed into the other
+window, which starts a turn. --quiet files it and does not type. --read
+prints notes waiting in the file. --notify is a desktop notice for Neo.
+
+  relay-protocol "please look at this now"
+  relay-protocol --quiet "file only"
+  relay-protocol --read
+  relay-protocol --notify "Need a choice on the layout"
+  relay-protocol --open 'https://example.com' --desktop 2
+  relay-protocol --desktop 2
+  relay-protocol --list
+  relay-protocol --to claude "message for Claude Code"
+  relay-protocol --to ruth "message for Ruth in Grok Bot"
+  relay-protocol --all "everyone: say this once"
+  relay-protocol --from ruth --to claude "Ruth here. reply"
+"""
+
+# =============================================================================
+# relay-protocol: how this program works (read this first)
+# =============================================================================
+#
+# WHAT IT IS
+#   A message relay between the AI agents running on this computer (Grok,
+#   Codex, Claude, and the "Grok Bot" seats such as Ava and Ruth). One agent
+#   runs `relay-protocol --to codex "..."` and the message reaches Codex.
+#
+#   Each agent is a separate program in its own window. None of them can see
+#   the others. This program is the glue between them.
+#
+# TWO WAYS A MESSAGE IS DELIVERED
+#   1. FILED (always happens). The message is appended as one JSON line to
+#      text files under ~/Work/.relay-protocol/talk/ (see "FILES" below).
+#      The receiving agent reads it later with `relay-protocol --read`.
+#   2. TYPED (the default; skipped with --quiet). The program also focuses the
+#      receiving agent's window, pastes the message into its prompt box, and
+#      presses Enter. That makes the other agent start working on it right
+#      away, as if a person had typed it. A "quiet" note is only filed.
+#
+# THE TWO SIDES: "HOST" AND "SANDBOX"
+#   - The HOST is the normal desktop session. From there this program can see
+#     and control windows through `hyprctl` (Hyprland, the window manager).
+#   - Some agents (Codex in particular) run in a SANDBOX and cannot see or
+#     control windows. When this program finds it cannot list windows, it
+#     writes the message as a small file into an INBOX folder instead.
+#   - A copy of this program runs on the host as a background service
+#     (`relay-protocol --serve`, started by relay-protocol.service). It
+#     watches the inbox, files each message, and types it into the right
+#     window. See serve() near the bottom of this file.
+#
+# WHAT THE BACKGROUND SERVICE DOES (relay-protocol --serve)
+#   It loops forever, about every 0.4 seconds:
+#     a. ensure_agents(): if the Grok or Codex window is missing, it launches
+#        it again and moves it to the scratchpad. THIS IS WHY CLOSING THOSE
+#        WINDOWS DOES NOT STICK while the service runs.
+#        To stop it: `systemctl --user stop relay-protocol.service`
+#     b. nudge_unread(): if an agent has unread quiet notes, types a short
+#        reminder into its window ("Unread quiet notes: N. Run
+#        relay-protocol --read."), at most once every 20 seconds.
+#     c. Delivers every message waiting in the inbox folders.
+#
+# FILES ON DISK (all plain text, all under ~/Work/.relay-protocol/)
+#   talk/log.jsonl          every message ever filed, one JSON object per line
+#   talk/for-<agent>.jsonl  the same messages, split by who they are for
+#   talk/cursor-<agent>     a number: how many characters of for-<agent>.jsonl
+#                           that agent has already read with --read
+#   talk/woken-<agent>      a number: how far the service has already nudged
+#                           that agent, so it does not nudge twice for one note
+#   inbox/*.msg             messages waiting for the host service to deliver
+#   /tmp/relay-protocol.lock  stops two copies typing into windows at once
+#
+#   A line in the talk files looks like:
+#     {"from": "grok", "to": "codex", "ts": "2026-11-20T23:14:45",
+#      "message": "the text", "quiet": false}
+#
+# WHO THE "SEATS" ARE
+#   Terminal seats (each has its own terminal window):
+#     grok, codex, claude, foot-claude (Claude in the foot drop-down console)
+#   Grok Bot seats (all share ONE "Grok Bot" app window; a note for any of
+#   them is typed into that window with a header naming who it is for):
+#     ava, ruth, creative, harkiver, logistics, health, research,
+#     communications, finance
+#   Grok and Codex are a PAIR: if either sends without --to, it goes to the
+#   other one. Everyone else must say --to <seat> or --all.
+#
+# HOW THE FILE IS LAID OUT (search for "SECTION" to jump between parts)
+#   SECTION 1   Settings: the list of seats, folder paths
+#   SECTION 2   Running commands and talking to Hyprland
+#   SECTION 3   Working out which agent a window or process belongs to
+#   SECTION 4   Choosing which window(s) should receive a note
+#   SECTION 5   Typing into a window: focus, keys, clipboard, screen reading
+#   SECTION 6   Small helpers: reading the message, who sent it, safety checks
+#   SECTION 7   The files on disk: inbox queue and the talk log
+#   SECTION 8   Typing a note into a window, safely
+#   SECTION 9   Keeping the Grok and Codex windows open
+#   SECTION 10  Nudging agents that have unread quiet notes
+#   SECTION 11  The background service loop (--serve)
+#   SECTION 12  Command-line entry point: what each flag does
+#
+# SAFETY HABITS USED THROUGHOUT
+#   - Anything sent to hyprctl is checked against a strict pattern first
+#     (window addresses, key names), so a strange value cannot inject extra
+#     window-manager commands.
+#   - Before pasting, it reads the target's prompt box from a screenshot. If
+#     someone is half-way through typing there, it refuses to paste over them
+#     (unless --force).
+#   - It saves your clipboard before pasting and puts it back afterwards.
+#   - It puts keyboard focus back on the window you were using.
+#
+# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20;
+# no code was changed when they were added).
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# SECTION 1: Settings - the list of seats (agents), and where files live
+# -----------------------------------------------------------------------------
+
+# Terminal seats have their own windows. Grok Bot seats share one app window:
+# a note for any of them is typed into that window, addressed by name.
+# foot-claude is the Omarchy Claude agent in the foot window on the Quake
+# console. claude is Claude Code in any other terminal.
+TERMINAL_AGENTS = ("grok", "codex", "claude", "foot-claude")
+BOTS = (
+    "ava",
+    "ruth",
+    "creative",
+    "harkiver",
+    "logistics",
+    "health",
+    "research",
+    "communications",
+    "finance",
+)
+AGENTS = TERMINAL_AGENTS + BOTS
+# Seats that can receive the 'you have unread notes' reminder (Grok Bot seats cannot).
+NUDGED = TERMINAL_AGENTS
+# Grok and Codex are a pair: with no --to, each sends to the other.
+# Everyone else says --to, or --all to reach the other open seats.
+PAIR = {"grok": "codex", "codex": "grok"}
+# Error text shown when the program cannot guess who a message is for.
+WHICH = "say which seat: --to grok, --to codex, --to claude, --to foot-claude, --to ruth (or ava, creative, harkiver, logistics, health, research, communications, finance), or --all"
+# A Hyprland window address looks like 0x55d1c3a0. Anything else is refused.
+ADDRESS = re.compile(r"0x[0-9a-fA-F]+$")
+# Lock file: only one copy of this program may be typing into windows at a time.
+LOCK_PATH = "/tmp/relay-protocol.lock"
+# The Codex seat cannot see Hyprland. It leaves messages here, and a host
+# `relay-protocol --serve` types them into the other window.
+INBOXES = (
+    Path("/home/neo/Work/.relay-protocol/inbox"),
+    Path.home() / ".local/share/relay-protocol/inbox",
+)
+# The permanent message record (log.jsonl, for-<agent>.jsonl, cursors).
+TALK = Path("/home/neo/Work/.relay-protocol/talk")
+# Grey hint text that agents show in an empty prompt box. When reading the
+# prompt box from a screenshot, these do not count as someone's draft.
+PLACEHOLDERS = (
+    "ask codex to do anything",
+    "ask grok to do anything",
+    "try \"",
+)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 2: Running commands and talking to Hyprland (the window manager)
+# `hyprctl` is Hyprland's command-line tool. "dispatch" tells it to do
+# something (focus a window, press a key); "clients" lists every window.
+# -----------------------------------------------------------------------------
+
+def run(args, timeout=3, input_bytes=None, check=False):
+    """Run a command and capture its output. Returns subprocess.CompletedProcess.
+
+    timeout: give up after this many seconds (raises TimeoutExpired).
+    check:   if True, raise an error when the command fails.
+    """
+    return subprocess.run(
+        args,
+        input=input_bytes,
+        capture_output=True,
+        timeout=timeout,
+        check=check,
+    )
+
+
+def dispatch(expr):
+    """Tell Hyprland to do something, e.g. focus a window or press a key.
+
+    `expr` is a Hyprland Lua expression such as
+    'hl.dsp.focus({ window = "address:0x1234" })'. Raises RuntimeError if
+    Hyprland reports a failure.
+    """
+    result = run(["hyprctl", "dispatch", expr])
+    text = ((result.stdout or b"") + (result.stderr or b"")).decode().strip()
+    if result.returncode != 0:
+        raise RuntimeError(text or f"hyprctl dispatch failed ({result.returncode})")
+    return text
+
+
+def clients():
+    """Return every open window as a list of dicts (from `hyprctl clients -j`)."""
+    return json.loads(run(["hyprctl", "clients", "-j"], check=True).stdout)
+
+
+def active_address():
+    """Return the address of the window that currently has keyboard focus."""
+    data = json.loads(run(["hyprctl", "activewindow", "-j"], check=True).stdout)
+    return data.get("address") or ""
+
+
+# -----------------------------------------------------------------------------
+# SECTION 3: Working out which agent a window or process belongs to
+# Hyprland tells us each window's process id (pid). We then look in /proc
+# (Linux's live list of running programs) at that process and its child
+# processes to find "grok", "codex" or "claude" in a command line.
+# -----------------------------------------------------------------------------
+
+def cmdline(pid):
+    """Return the full command line of process `pid` as one string.
+
+    Linux stores it in /proc/<pid>/cmdline with NUL bytes between the words.
+    Returns "" if the process has gone away.
+    """
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def command_agent(text):
+    """The agent a process is, ignoring --to and --from arguments."""
+    skip = False
+    for part in text.split():
+        if skip:
+            skip = False
+            continue
+        if part in ("--to", "--from"):
+            skip = True
+            continue
+        base = os.path.basename(part)
+        if base == "claude" and "OMARCHY_AGENT_CLAUDE_HOME" in text:
+            return "foot-claude"
+        if base in ("grok", "codex", "claude"):
+            return base
+    return None
+
+
+def agent_of(pid):
+    """Which agent (grok/codex/claude/foot-claude) process `pid` is, or None."""
+    return command_agent(cmdline(pid))
+
+
+def process_index():
+    """Take a snapshot of every running process.
+
+    Returns two dicts:
+      children: parent pid -> list of its child pids
+      texts:    pid -> that process's command line
+    Used to search down from a window's process to find the agent in it.
+    """
+    children = {}
+    texts = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            status = open(f"/proc/{pid}/status").read()
+            raw = open(f"/proc/{pid}/cmdline", "rb").read()
+        except OSError:
+            continue
+        ppid = 0
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+                break
+        children.setdefault(ppid, []).append(pid)
+        texts[pid] = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+    return children, texts
+
+
+def agent_in_tree(root, children, texts):
+    """Search a window's process and its descendants for an agent.
+
+    A terminal window's own process is the terminal (e.g. alacritty); the
+    agent is a child or grandchild of it. Breadth-first search, stopping
+    after 40 processes so it can never run away.
+    """
+    queue = [root]
+    seen = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        name = command_agent(texts.get(pid, ""))
+        if name:
+            return name
+        if len(seen) > 40:
+            break
+        queue.extend(children.get(pid, ()))
+    return None
+
+
+def ancestors():
+    """Return the set of pids from this process up through its parents.
+
+    Used to work out who is SENDING: if relay-protocol was run by Codex,
+    Codex is one of our ancestors, and so is Codex's terminal window.
+    """
+    pid = os.getpid()
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            status = open(f"/proc/{pid}/status").read()
+        except OSError:
+            break
+        ppid = 0
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+                break
+        pid = ppid
+    return seen
+
+
+def agent_windows():
+    """Return every open window that belongs to an agent.
+
+    Each item is Hyprland's window dict with one extra key, "agent", set to
+    "grok", "codex", "claude", "foot-claude" or "grok-bot". Windows that
+    are not agents (browsers etc.) are left out.
+    """
+    children, texts = process_index()
+    found = []
+    for client in clients():
+        klass = client.get("class") or ""
+        pid = client.get("pid") or 0
+        if klass == "grok-bot":
+            name = "grok-bot"
+        else:
+            # The foot window's own command line carries OMARCHY_AGENT_CLAUDE_HOME.
+            # Claude Code in another terminal does not, even if a child process does.
+            name = agent_in_tree(pid, children, texts)
+        if not name:
+            continue
+        item = dict(client)
+        item["agent"] = name
+        found.append(item)
+    return found
+
+
+# -----------------------------------------------------------------------------
+# SECTION 4: Choosing which window(s) should receive a note
+# A "window" here is a dict from `hyprctl clients -j`, plus an "agent" key
+# added by agent_windows(). Windows on a normal desktop are preferred over
+# ones hidden on a "special" workspace such as the scratchpad.
+# -----------------------------------------------------------------------------
+
+def workspace_label(window):
+    """Name of the workspace a window is on, e.g. '2' or 'special:scratchpad'."""
+    ws = window.get("workspace") or {}
+    if ws.get("name"):
+        return str(ws["name"])
+    ident = ws.get("id")
+    return "" if ident is None else str(ident)
+
+
+def is_special(window):
+    """True if the window is on a hidden 'special' workspace such as the scratchpad."""
+    return workspace_label(window).startswith("special")
+
+
+def self_window_of(windows, self_pids):
+    """The window that belongs to the sender (one of `self_pids`), or None."""
+    return next((w for w in windows if w.get("pid") in self_pids), None)
+
+
+def without(windows, skip):
+    """Return `windows` with the window `skip` removed (by address)."""
+    if skip is None:
+        return list(windows)
+    address = skip.get("address")
+    return [w for w in windows if w.get("address") != address]
+
+
+def account_bot_pid():
+    """Pid of the signed-in Grok Bot, from its profile lock."""
+    lock = Path.home() / ".config" / "Grok Bot" / "SingletonLock"
+    try:
+        target = os.readlink(lock)
+    except OSError:
+        return None
+    pid = target.rsplit("-", 1)[-1]
+    return int(pid) if pid.isdigit() else None
+
+
+def separate_profile(window):
+    """True if this Grok Bot window is a second, separate profile.
+
+    Only the signed-in profile should receive notes; another profile may be
+    stuck on a terms-of-service screen and would swallow the message.
+    """
+    home = account_bot_pid()
+    if home is None:
+        return False
+    return window.get("pid") != home
+
+
+def pick_grok_bot(windows):
+    """Choose the single best Grok Bot window to type into.
+
+    Preference order: the signed-in profile, then one on a normal (not
+    hidden) desktop, then one that is not fullscreen. Returns a list with
+    at most one window.
+    """
+    bots = [w for w in windows if w.get("agent") == "grok-bot"]
+    # A second profile can sit on a terms screen and must not eat the note.
+    home = [w for w in bots if not separate_profile(w)] or bots
+    normal = [w for w in home if not is_special(w)] or home
+    quiet = [w for w in normal if not w.get("fullscreen")]
+    if quiet:
+        return [quiet[0]]
+    return normal[:1]
+
+
+def pick_terminal(windows, name):
+    """All windows for agent `name`, preferring ones on a normal desktop.
+
+    Falls back to windows on hidden workspaces (like the scratchpad) if
+    there are no others.
+    """
+    matches = [w for w in windows if w.get("agent") == name]
+    normal = [w for w in matches if not is_special(w)]
+    return normal or matches
+
+
+def targets_for(windows, explicit):
+    """Windows that should receive a typed note for this seat."""
+    if explicit in BOTS:
+        chosen = pick_grok_bot(windows)
+        if not chosen:
+            raise SystemExit("no Grok Bot window is open")
+        return chosen
+    if explicit in TERMINAL_AGENTS:
+        chosen = pick_terminal(windows, explicit)
+        if not chosen:
+            raise SystemExit(f"no {explicit} window is open")
+        return chosen
+    raise SystemExit(WHICH)
+
+
+def room_windows(windows, origin, self_window=None):
+    """Every open seat except the sender's own window.
+
+    A second window of the same agent still gets the note. From the host
+    service there is no self window, so the sender's agent is skipped whole.
+    """
+    chosen = []
+    for name in TERMINAL_AGENTS:
+        if self_window is None and name == origin:
+            continue
+        for window in pick_terminal(windows, name):
+            if self_window and window.get("address") == self_window.get("address"):
+                continue
+            chosen.append(window)
+    if origin not in BOTS:
+        chosen.extend(pick_grok_bot(windows))
+    return chosen
+
+
+def choose_target(windows, self_pids, explicit):
+    """Decide who receives a message when sending from the host.
+
+    Returns (sender's own window or None, list of target windows).
+      - With --to: that seat's window(s), never the sender's own window.
+      - Without --to, from Grok or Codex: the other one of the pair.
+      - Otherwise: only works if exactly one other agent window is open;
+        if there is any doubt it stops and asks you to say --to.
+    """
+    self_window = self_window_of(windows, self_pids)
+    if explicit:
+        return self_window, without(targets_for(windows, explicit), self_window) or targets_for(windows, explicit)
+    origin = (self_window or {}).get("agent") or self_agent(self_pids) or ""
+    partner = PAIR.get(origin)
+    if partner:
+        matches = without(pick_terminal(windows, partner), self_window)
+        if not matches:
+            raise SystemExit(f"no {partner} window is open")
+        return self_window, matches
+    others = without(windows, self_window)
+    if self_window is not None:
+        others = [w for w in others if w.get("agent") != self_window.get("agent")] or others
+    if len(others) != 1:
+        raise SystemExit(WHICH)
+    return self_window, others
+
+
+# -----------------------------------------------------------------------------
+# SECTION 5: Typing into a window - focus, key presses, clipboard, and
+# reading the screen to check nobody is mid-sentence in the prompt box
+# -----------------------------------------------------------------------------
+
+def is_busy(title):
+    """True if the window title starts with a spinner character.
+
+    Agents show a braille "spinner" (Unicode U+2800 to U+28FF) in their
+    title while they are working.
+    """
+    return bool(title) and 0x2800 <= ord(title[0]) <= 0x28FF
+
+
+def submit_key(agent, title, mode):
+    """Which key sends the pasted message: "Return" or "Tab".
+
+    mode "enter"/"tab" forces that key. In "auto" mode Codex gets Tab while
+    it is busy, which queues the message for after its current task
+    instead of interrupting it. Everyone else gets Enter.
+    """
+    if mode == "enter":
+        return "Return"
+    if mode == "tab":
+        return "Tab"
+    if agent == "codex" and is_busy(title):
+        return "Tab"
+    return "Return"
+
+
+def focus(address):
+    """Give keyboard focus to the window at `address`, and wait until it has it.
+
+    Waits up to about 0.6 seconds; raises RuntimeError if focus did not move,
+    so we never paste into the wrong window.
+    """
+    if not ADDRESS.fullmatch(address):
+        raise RuntimeError(f"refusing odd window address {address!r}")
+    dispatch('hl.dsp.focus({ window = "address:' + address + '" })')
+    for _ in range(15):
+        if active_address() == address:
+            return
+        time.sleep(0.04)
+    raise RuntimeError(f"focus stayed on {active_address()}, not {address}")
+
+
+def tap(mods, key):
+    """Press and release one key, e.g. tap("CTRL SHIFT", "V") for paste.
+
+    Key and modifier names are checked against a strict pattern before
+    being sent to Hyprland.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_]+", key):
+        raise RuntimeError(f"refusing odd key {key!r}")
+    if mods and not re.fullmatch(r"[A-Z ]+", mods):
+        raise RuntimeError(f"refusing odd mods {mods!r}")
+    for state in ("down", "up"):
+        dispatch(
+            "hl.dsp.send_key_state({ "
+            + f'mods = "{mods}", key = "{key}", state = "{state}"'
+            + " })"
+        )
+        time.sleep(0.05)
+
+
+def copy_text(payload):
+    """Put `payload` (bytes) on the clipboard with wl-copy.
+
+    Returns the wl-copy process if it is still running (it stays alive to
+    serve the clipboard), so the caller can stop it afterwards.
+    """
+    proc = subprocess.Popen(
+        ["wl-copy", "--type", "text/plain", "--trim-newline"],
+        stdin=subprocess.PIPE,
+    )
+    proc.stdin.write(payload)
+    proc.stdin.close()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        return proc
+    return None
+
+
+def clipboard_snapshot():
+    """Return the current clipboard text (bytes), or None if empty/unreadable."""
+    listed = run(["wl-paste", "--list-types"], timeout=1)
+    if listed.returncode != 0:
+        return None
+    pasted = run(["wl-paste", "--type", "text/plain"], timeout=1)
+    if pasted.returncode != 0:
+        return None
+    return pasted.stdout
+
+
+def restore_clipboard(payload):
+    """Put back the clipboard saved by clipboard_snapshot() (or clear it if it was empty)."""
+    if payload is None:
+        proc = subprocess.Popen(["wl-copy", "--clear"])
+    else:
+        proc = subprocess.Popen(["wl-copy", "--type", "text/plain"], stdin=subprocess.PIPE)
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def composer_text(window):
+    """Read the bottom 230 pixels of a window as text, using a screenshot.
+
+    Tools: grim (screenshot), ffmpeg (crop), tesseract (OCR, turns pixels
+    into text). That area is where the agent's prompt box ("composer")
+    is. Returns None if ffmpeg or tesseract is not installed.
+    """
+    if not shutil_which("tesseract") or not shutil_which("ffmpeg"):
+        return None
+    x, y = window["at"]
+    width, height = window["size"]
+    with tempfile.TemporaryDirectory(prefix="relay-protocol-") as tmp:
+        full = os.path.join(tmp, "full.png")
+        crop = os.path.join(tmp, "crop.png")
+        run(["grim", "-g", f"{x},{y} {width}x{height}", full], timeout=4, check=True)
+        run(
+            ["ffmpeg", "-y", "-i", full, "-vf", "crop=iw:230:0:ih-230", crop],
+            timeout=4,
+            check=True,
+        )
+        text = run(["tesseract", crop, "stdout", "--psm", "6"], timeout=8)
+    return text.stdout.decode("utf-8", "replace")
+
+
+def shutil_which(name):
+    """Find program `name` on the PATH (a small copy of shutil.which)."""
+    for directory in os.environ.get("PATH", "").split(":"):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def draft_in_composer(text, agent=None):
+    """Given the OCR text from composer_text(), return any half-typed draft.
+
+    Returns "" if the prompt box looks empty, None if it could not be read.
+    For terminal agents, the prompt box is the LAST line starting with ">".
+    Grey hint text (PLACEHOLDERS) does not count as a draft. Grok Bot has no
+    ">" prompt, so there a line counts only if it is mostly real words.
+    """
+    if text is None:
+        return None
+    if agent == "grok-bot":
+        # Grok Bot has no ">" prompt. OCR of the bottom bar is noisy, so only
+        # a line that is mostly words counts as a draft.
+        lines = []
+        for raw in text.splitlines():
+            line = " ".join(raw.split())
+            letters = sum(ch.isalpha() for ch in line)
+            marks = sum(not ch.isalnum() and not ch.isspace() for ch in line)
+            if letters >= 36 and marks <= 4:
+                lines.append(line)
+        return lines[-1][:160] if lines else ""
+    # The composer is the last ">" prompt. Status lines sit under it and
+    # older turns sit above it, so only that prompt counts as a draft.
+    prompts = []
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            prompts.append(stripped.lstrip(">").strip())
+    if not prompts:
+        return ""
+    body = prompts[-1]
+    low = body.lower()
+    if not body or any(holder in low for holder in PLACEHOLDERS) or "to do anything" in low:
+        return ""
+    return body
+
+
+# -----------------------------------------------------------------------------
+# SECTION 6: Small helpers - reading the message text, working out who is
+# sending, and checking URLs and desktop numbers before using them
+# -----------------------------------------------------------------------------
+
+def read_message(args):
+    """The message text: from the command line, or piped in on standard input."""
+    if args.message:
+        return " ".join(args.message)
+    if not sys.stdin.isatty():
+        incoming = sys.stdin.read()
+        if incoming.endswith("\n"):
+            incoming = incoming[:-1]
+        return incoming
+    raise SystemExit("pass a message, or pipe one in")
+
+
+def self_agent(pids):
+    """Work out which agent is running this command, from its process ancestors.
+
+    foot-claude is checked first because that window also contains a
+    "claude" process.
+    """
+    own = os.getpid()
+    found = None
+    for pid in pids:
+        if pid == own:
+            continue
+        text = cmdline(pid)
+        # Prefer the foot window over the claude process it launched.
+        if "OMARCHY_AGENT_CLAUDE_HOME" in text:
+            return "foot-claude"
+        name = command_agent(text)
+        if name and found is None:
+            found = name
+    return found
+
+
+def check_url(url):
+    """Allow only http:// and https:// URLs with no control characters; else raise ValueError."""
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        raise ValueError("only http and https URLs can be opened")
+    if any(char in url for char in "\n\r\x00"):
+        raise ValueError("refusing a URL with a control character")
+    return url
+
+
+def check_desktop(number):
+    """Allow only workspace numbers 1 to 20; return it as an int (or None)."""
+    if number is None:
+        return None
+    if isinstance(number, str) and number.isdigit():
+        number = int(number)
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= 20:
+        raise ValueError("desktop must be a workspace from 1 to 20")
+    return number
+
+
+def focus_desktop(number):
+    """Switch the screen to workspace `number`."""
+    number = check_desktop(number)
+    dispatch('hl.dsp.focus({ workspace = "' + str(number) + '" })')
+
+
+def host_open(url, desktop=None):
+    """Open `url` in the default browser, optionally on workspace `desktop` first."""
+    url = check_url(url)
+    desktop = check_desktop(desktop)
+    if desktop is not None:
+        focus_desktop(desktop)
+        time.sleep(0.3)
+    subprocess.Popen(
+        ["omarchy-launch-browser", url],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    where = f" on desktop {desktop}" if desktop is not None else ""
+    print(f"opened {url}{where}", flush=True)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 7: The files on disk
+#   inbox/*.msg   = waiting to be delivered by the host service
+#   talk/*.jsonl  = the permanent record of every message
+# -----------------------------------------------------------------------------
+
+def enqueue_action(url, desktop):
+    """From the sandbox: ask the host service to open a URL or switch desktop.
+
+    Writes a small JSON file into the inbox, e.g.
+    {"do": "open", "url": "https://...", "desktop": 2}
+    """
+    if url:
+        check_url(url)
+    desktop = check_desktop(desktop)
+    if not url and desktop is None:
+        raise SystemExit("pass --open, --desktop, or a message")
+    payload = {"do": "open" if url else "desktop"}
+    if url:
+        payload["url"] = url
+    if desktop is not None:
+        payload["desktop"] = desktop
+    inbox = INBOXES[0]
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{time.time_ns()}-{os.getpid()}.msg"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    print("queued for the host")
+
+
+def seat_name(name):
+    """Return `name` if it is a known seat, otherwise None."""
+    return name if name in AGENTS else None
+
+
+def resolve_sender(sender, self_window, pids):
+    """Decide what name to sign a message with.
+
+    Order: --from if given, then the agent that owns our window, then the
+    agent found in our process ancestors, else "unknown".
+    """
+    named = seat_name(sender)
+    if named:
+        return named
+    window_agent = (self_window or {}).get("agent")
+    if window_agent in AGENTS:
+        return window_agent
+    return self_agent(pids) or sender or "unknown"
+
+
+def enqueue(target, message, wake=False, sender=None):
+    """From the sandbox: queue a message for the host service to deliver.
+
+    target: a seat name, or "*" for everyone. wake=True means "type it into
+    the window too", False means a quiet note (file only).
+    """
+    origin = seat_name(sender) or self_agent(ancestors()) or "unknown"
+    inbox = INBOXES[0]
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{time.time_ns()}-{os.getpid()}.msg"
+    payload = {"from": origin, "to": target, "message": message}
+    if wake:
+        payload["wake"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    print(f"queued for {target}")
+
+
+def file_message(sender, recipient, message, quiet=False):
+    """Write one message permanently into the talk files.
+
+    Appends the same JSON line to talk/log.jsonl (everything) and to
+    talk/for-<recipient>.jsonl (that seat's mailbox).
+    """
+    if recipient not in AGENTS:
+        raise ValueError(f"no such agent {recipient}")
+    text = str(message).strip()
+    if not text:
+        raise ValueError("refusing to file an empty message")
+    TALK.mkdir(parents=True, exist_ok=True)
+    record = {
+        "from": sender if sender in AGENTS else "unknown",
+        "to": recipient,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "message": text,
+        "quiet": bool(quiet),
+    }
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    for name in ("log.jsonl", f"for-{recipient}.jsonl"):
+        with open(TALK / name, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    print(f"filed for {recipient}", flush=True)
+
+
+def read_unread(agent):
+    """Print `agent`'s new messages, then mark them as read.
+
+    The cursor file holds how many characters of for-<agent>.jsonl have
+    already been read. Everything after that point is new. After printing,
+    the cursor moves to the end of the file.
+    """
+    TALK.mkdir(parents=True, exist_ok=True)
+    path = TALK / f"for-{agent}.jsonl"
+    cursor_path = TALK / f"cursor-{agent}"
+    data = path.read_text(encoding="utf-8") if path.exists() else ""
+    cursor = 0
+    if cursor_path.exists():
+        try:
+            cursor = int(cursor_path.read_text().strip() or "0")
+        except ValueError:
+            cursor = 0
+    if cursor < 0 or cursor > len(data):
+        cursor = 0
+    chunk = data[cursor:]
+    cursor_path.write_text(str(len(data)))
+    if not chunk.strip():
+        print(f"no new messages for {agent}")
+        return
+    for line in chunk.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            print(line)
+            continue
+        print(f"{item.get('ts', '')} {item.get('from', '')}: {item.get('message', '')}")
+
+
+def host_notify(message):
+    """Show Neo a short desktop notification (cut to 180 characters)."""
+    text = " ".join(str(message).split())
+    if not text:
+        raise ValueError("refusing an empty notification")
+    if len(text) > 180:
+        text = text[:177] + "..."
+    subprocess.run(
+        [
+            "omarchy-notification-send",
+            "-u",
+            "low",
+            "--transient",
+            "-t",
+            "8000",
+            "Agents",
+            text,
+        ],
+        check=False,
+    )
+    print("notified Neo", flush=True)
+
+
+def enqueue_notify(message):
+    """From the sandbox: ask the host service to show a desktop notification."""
+    text = " ".join(str(message).split())
+    if not text:
+        raise SystemExit("refusing an empty notification")
+    inbox = INBOXES[0]
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{time.time_ns()}-{os.getpid()}.msg"
+    path.write_text(json.dumps({"do": "notify", "message": text}), encoding="utf-8")
+    print("queued for the host")
+
+
+def pending_messages():
+    """Every waiting *.msg file in the inbox folders, oldest first (names start with a timestamp)."""
+    found = []
+    for inbox in INBOXES:
+        if inbox.is_dir():
+            found.extend(inbox.glob("*.msg"))
+    return sorted(found)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 8: Typing a note into a window, safely
+# -----------------------------------------------------------------------------
+
+def typed_body(window, message, sender, seat):
+    """The exact text to paste into `window`.
+
+    Terminal agents get the message as-is. The shared Grok Bot window gets
+    a header saying who it is for and who sent it, plus a ready-made
+    command to reply with.
+    """
+    if window.get("agent") != "grok-bot":
+        return message
+    who = sender if sender in AGENTS else "the agents"
+    back = who if who in AGENTS else "grok"
+    if seat in BOTS:
+        label = seat
+        reply_as = seat
+    else:
+        label = "Ava, Ruth, Creative, Harkiver, Logistics, Health, Research, Communications, and Finance"
+        reply_as = "ruth"
+    hint = f'relay-protocol --from {reply_as} --to {back} "{reply_as.title()} here. <reply>"'
+    return f"[relay-protocol for {label}, from {who}]\n{message}\n\n(Reply with: {hint})"
+
+
+def type_into(target, message, submit, force):
+    """Paste `message` into `target`'s prompt box and (usually) send it.
+
+    Steps: take the lock so only one copy types at once; remember the
+    focused window and the clipboard; focus the target; read its prompt
+    box and refuse if there is a draft (unless force); copy the message to
+    the clipboard; press Ctrl+Shift+V; press Enter or Tab (unless submit
+    is "none"); then always restore the clipboard and the focus.
+    """
+    lock_file = open(LOCK_PATH, "a")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError("another relay-protocol send is already running")
+
+    # Remember where you were, and what was on your clipboard, so both can be put back.
+    previous = active_address()
+    saved_clip = clipboard_snapshot()
+    copier = None
+    focused = False
+    try:
+        focus(target["address"])
+        focused = True
+        fresh = next(w for w in agent_windows() if w["address"] == target["address"])
+        # Screenshot the bottom of the window and read it; stop if someone has typed something.
+        draft = draft_in_composer(composer_text(fresh), fresh.get("agent"))
+        if draft and not force:
+            raise RuntimeError(f"composer has text: {draft}")
+        copier = copy_text(message.encode())
+        time.sleep(0.08)
+        # Paste. Terminals use Ctrl+Shift+V rather than Ctrl+V.
+        tap("CTRL SHIFT", "V")
+        time.sleep(0.12)
+        how = "pasted"
+        if submit != "none":
+            key = submit_key(fresh["agent"], fresh.get("title") or "", submit)
+            tap("", key)
+            how = "queued" if key == "Tab" else "sent"
+        print(f"{how} to {fresh['agent']}", flush=True)
+    finally:
+        if copier is not None and copier.poll() is None:
+            copier.terminate()
+        # Always runs, even after an error: put the clipboard back, then the focus.
+        restore_clipboard(saved_clip)
+        if focused and previous and previous != target["address"]:
+            try:
+                focus(previous)
+            except RuntimeError as error:
+                print(f"could not restore focus: {error}", file=sys.stderr)
+        lock_file.close()
+
+
+# -----------------------------------------------------------------------------
+# SECTION 9: Keeping the Grok and Codex windows open
+# While `relay-protocol --serve` runs, ensure_agents() relaunches Grok or
+# Codex whenever its window is missing, then hides it on the scratchpad.
+# So if you close one of them it comes back within about 5-20 seconds.
+# To stop that, stop the service:
+#     systemctl --user stop relay-protocol.service
+# To remove an agent from this, delete its entry in AGENT_COMMANDS.
+# -----------------------------------------------------------------------------
+
+# Same launch the open windows use: agent class, unattended permissions,
+# work directory, then the scratchpad with Grok on the left and Codex on the right.
+AGENT_COMMANDS = {
+    "grok": [
+        "omarchy-launch-tui",
+        "--app-id=org.omarchy.agent",
+        "bash",
+        "-lc",
+        "cd /home/neo/Work && exec env -u GROK_HOME OMARCHY_AGENT_GROK_HOME= grok --permission-mode bypassPermissions",
+    ],
+    "codex": [
+        "omarchy-launch-tui",
+        "--app-id=org.omarchy.agent",
+        "bash",
+        "-lc",
+        "cd /home/neo/Work && exec env -u CODEX_HOME OMARCHY_AGENT_CODEX_HOME= codex --approve-for-me",
+    ],
+}
+SCRATCHPAD = "special:scratchpad"
+# When ensure_agents() last looked (it only looks every 5 seconds).
+_last_agent_check = 0.0
+# agent name -> time it was last launched, so a crashing agent is relaunched at most every 20 s.
+_last_launch = {}
+
+
+def windows_of(name):
+    """All open windows belonging to agent `name`."""
+    return [window for window in agent_windows() if window["agent"] == name]
+
+
+def wait_for_new_window(name, seen, timeout=12):
+    """Wait up to `timeout` seconds for a NEW window of agent `name` to appear.
+
+    `seen` is the set of window addresses that existed before launching, so
+    an old window is not mistaken for the new one. Returns it, or None.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            for window in windows_of(name):
+                if window["address"] not in seen:
+                    return window
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+            pass
+        time.sleep(0.3)
+    return None
+
+
+def move_to_scratchpad(address):
+    """Move a window to the hidden scratchpad without switching you to it (Super+S shows it)."""
+    if not ADDRESS.fullmatch(address):
+        raise RuntimeError(f"refusing odd window address {address!r}")
+    dispatch(
+        "hl.dsp.window.move({ "
+        + f'window = "address:{address}", workspace = "{SCRATCHPAD}", follow = false'
+        + " })"
+    )
+
+
+def ensure_agents():
+    """Relaunch Grok or Codex if its window is missing.
+
+    THIS IS WHAT REOPENS THEM ON THE SCRATCHPAD. Called by the service loop
+    every 0.4 s, but only actually checks every 5 s. For each agent in
+    AGENT_COMMANDS with no open window, it launches it (at most once every
+    20 s), waits for the window, and moves it to the scratchpad.
+    """
+    global _last_agent_check
+    now = time.time()
+    if now - _last_agent_check < 5:
+        return
+    _last_agent_check = now
+    try:
+        # Which agents have a window open right now?
+        present = {window["agent"] for window in agent_windows()}
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+        return
+    for name, command in AGENT_COMMANDS.items():
+        if name in present:
+            _last_launch.pop(name, None)
+            continue
+        # Launched less than 20 s ago and still not visible: give it time, do not launch again.
+        if now - _last_launch.get(name, 0) < 20:
+            continue
+        try:
+            seen = {window["address"] for window in windows_of(name)}
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+            seen = set()
+        _last_launch[name] = time.time()
+        subprocess.Popen(
+            command,
+            cwd="/home/neo/Work",
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"launched {name}", flush=True)
+        window = wait_for_new_window(name, seen)
+        if window is None:
+            print(f"{name} window did not appear", file=sys.stderr, flush=True)
+            continue
+        try:
+            move_to_scratchpad(window["address"])
+            print(f"placed {name} on the scratchpad", flush=True)
+        except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+            print(f"could not place {name}: {error}", file=sys.stderr, flush=True)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 10: Nudging agents that have unread quiet notes
+# A "quiet" note is only written to the file; nobody types it into the
+# agent's window. So the service occasionally types a one-line reminder.
+# -----------------------------------------------------------------------------
+
+def cursor_at(path, length):
+    """Read a position number from a cursor file; 0 if missing, bad, or past the end of the file."""
+    if not path.exists():
+        return 0
+    try:
+        value = int(path.read_text(encoding="utf-8").strip() or "0")
+    except ValueError:
+        return 0
+    if value < 0 or value > length:
+        return 0
+    return value
+
+
+# When nudge_unread() last ran (it only runs every 20 seconds).
+_last_nudge = 0.0
+
+
+def nudge_unread():
+    """Wake an agent who has unread quiet notes. Do not notify Neo."""
+    global _last_nudge
+    now = time.time()
+    if now - _last_nudge < 20:
+        return
+    _last_nudge = now
+    if not TALK.is_dir():
+        return
+    try:
+        open_windows = agent_windows()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+        return
+    for agent in NUDGED:
+        path = TALK / f"for-{agent}.jsonl"
+        data = path.read_text(encoding="utf-8") if path.exists() else ""
+        read_at = cursor_at(TALK / f"cursor-{agent}", len(data))
+        woken_path = TALK / f"woken-{agent}"
+        woken_at = cursor_at(woken_path, len(data))
+        if len(data) <= read_at:
+            if woken_at < len(data):
+                woken_path.write_text(str(len(data)))
+            continue
+        # Only look at notes that are BOTH unread AND not already nudged about.
+        # Then count how many of those were quiet (typed notes need no reminder).
+        start = max(read_at, woken_at)
+        if len(data) <= start:
+            continue
+        count = 0
+        for line in data[start:].splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if item.get("quiet"):
+                count += 1
+        if count == 0:
+            woken_path.write_text(str(len(data)))
+            continue
+        chosen = pick_terminal(open_windows, agent)
+        if not chosen:
+            continue
+        window = chosen[0]
+        note = f"Unread quiet notes: {count}. Run relay-protocol --read."
+        try:
+            type_into(window, note, "auto", False)
+        except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
+            print(f"nudge {agent} waiting: {error}", flush=True)
+            continue
+        woken_path.write_text(str(len(data)))
+        print(f"nudged {agent}", flush=True)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 11: The background service loop (`relay-protocol --serve`)
+# -----------------------------------------------------------------------------
+
+def file_seats(sender, seats, message, quiet):
+    """File the same message for each seat in `seats`."""
+    for seat in seats:
+        file_message(sender, seat, message, quiet=quiet)
+
+
+def serve(args):
+    """The background service: loop forever, delivering queued messages.
+
+    Each pass: relaunch missing agents, nudge agents with unread quiet
+    notes, then handle every inbox file in order. A file that fails is left
+    in place and retried on the next pass; one that succeeds is deleted.
+    """
+    print("serving the relay-protocol inbox", flush=True)
+    waiting = False
+    while True:
+        ensure_agents()
+        nudge_unread()
+        files = pending_messages()
+        if not files:
+            waiting = False
+            time.sleep(0.4)
+            continue
+        for path in files:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                # An inbox file is either an ACTION ({"do": "open" | "desktop" | "notify"})
+                # or a MESSAGE ({"from", "to", "message", optional "wake"}).
+                action = data.get("do")
+                if action == "open":
+                    host_open(data.get("url"), data.get("desktop"))
+                elif action == "desktop":
+                    focus_desktop(data.get("desktop"))
+                    print(f"focused desktop {data.get('desktop')}", flush=True)
+                elif action == "notify":
+                    host_notify(data.get("message") or "")
+                elif action:
+                    raise RuntimeError(f"unknown action {action}")
+                else:
+                    sender = data.get("from") or "unknown"
+                    message = data["message"]
+                    recipient = data.get("to")
+                    origin = sender if sender in AGENTS else ""
+                    # Step 1: write it into the talk files (once). "filed" is saved back into
+                    # the inbox file so that, if typing fails and we retry, it is not filed twice.
+                    if not data.get("filed"):
+                        if recipient == "*":
+                            seats = [name for name in AGENTS if name != origin]
+                        elif recipient in AGENTS:
+                            seats = [recipient]
+                        else:
+                            raise RuntimeError(f"no such agent {recipient}")
+                        file_seats(sender, seats, message, quiet=not data.get("wake"))
+                        data["filed"] = True
+                        path.write_text(json.dumps(data), encoding="utf-8")
+                    # Step 2: if it is not a quiet note, type it into the receiving window(s).
+                    if data.get("wake"):
+                        live = agent_windows()
+                        if recipient == "*":
+                            typed = room_windows(live, origin)
+                            seat = "*"
+                        else:
+                            typed = targets_for(live, recipient)
+                            seat = recipient
+                        for window in typed:
+                            try:
+                                type_into(window, typed_body(window, message, sender, seat), "auto", False)
+                            except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
+                                print(f"not typed into {window.get('agent')}: {error}", flush=True)
+            # Something went wrong (for example the window is not open): keep the file
+            # in the inbox and try again on the next loop. Only log the error once.
+            except Exception as error:
+                if not waiting:
+                    print(f"holding {path.name}: {error}", file=sys.stderr, flush=True)
+                    waiting = True
+                continue
+            # Delivered: remove it from the inbox.
+            path.unlink(missing_ok=True)
+            waiting = False
+        time.sleep(0.4)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 12: Command-line entry point - what happens for each flag
+# -----------------------------------------------------------------------------
+
+def show_list(windows, self_window):
+    """--list: print every agent window, its workspace and address."""
+    for window in windows:
+        mark = ""
+        if self_window and window["address"] == self_window["address"]:
+            mark += " (self)"
+        if window.get("agent") == "grok-bot" and separate_profile(window):
+            mark += " (separate profile)"
+        where = workspace_label(window) or "?"
+        print(f"{window['agent']:8} ws={where} {window['address']} {window['title']}{mark}")
+    print("grok-bot seats: " + ", ".join(BOTS))
+
+
+def main():
+    """Read the command-line flags and do what they ask.
+
+    Order of checks: --serve, --read, --notify, --open/--desktop, then a
+    normal message. If the windows cannot be seen (sandbox), the request is
+    queued for the host; otherwise it is filed and typed directly.
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("message", nargs="*", help="text to type")
+    parser.add_argument("--to", choices=AGENTS, help="which agent receives it. Default: the other one")
+    parser.add_argument("--from", dest="sender", choices=AGENTS, help="name yourself when relay-protocol cannot tell who you are (ava, ruth, the other bots, or Codex in its sandbox). This wins over the window.")
+    parser.add_argument("--no-send", action="store_true", help="paste only, do not press Enter or Tab")
+    parser.add_argument("--submit", choices=("auto", "enter", "tab"), default="auto")
+    parser.add_argument("--force", action="store_true", help="type even if the composer already has a draft")
+    parser.add_argument("--list", action="store_true", help="show the agent windows and exit")
+    parser.add_argument("--check", action="store_true", help="report the target and whether its composer looks empty")
+    parser.add_argument("--serve", action="store_true", help="on the host, type queued messages from the other side")
+    parser.add_argument("--open", metavar="URL", help="open an http(s) URL in the default browser")
+    parser.add_argument("--desktop", type=int, help="focus this workspace, from 1 to 20")
+    parser.add_argument("--read", action="store_true", help="print new messages filed for this agent")
+    parser.add_argument("--notify", metavar="TEXT", help="show Neo one short desktop notification")
+    parser.add_argument("--quiet", action="store_true", help="file the message only, do not type it into the other window")
+    parser.add_argument("--wake", action="store_true", help="type the message into the other window (this is already the default)")
+    parser.add_argument("--all", action="store_true", help="file it for every other seat and type it into each open window")
+    args = parser.parse_args()
+
+    # --serve: become the background service and never return.
+    if args.serve:
+        serve(args)
+        return
+
+    # --read: print this agent's unread notes and mark them read.
+    if args.read:
+        agent = args.to or self_agent(ancestors()) or args.sender
+        if agent not in AGENTS:
+            raise SystemExit(WHICH)
+        read_unread(agent)
+        return
+
+    try:
+        # Can we see the desktop? If this fails we are in a sandbox (for example
+        # Codex), and everything below is queued in the inbox for the host instead.
+        windows = agent_windows()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError):
+        windows = None
+
+    # From here on, every branch has two paths:
+    #   windows is None  -> SANDBOX: queue the request in the inbox for the host.
+    #   otherwise        -> HOST: do it directly.
+    if args.notify:
+        if windows is None:
+            enqueue_notify(args.notify)
+        else:
+            host_notify(args.notify)
+        return
+
+    if args.open or args.desktop is not None:
+        if windows is None:
+            enqueue_action(args.open, args.desktop)
+        elif args.open:
+            host_open(args.open, args.desktop)
+        else:
+            focus_desktop(args.desktop)
+            print(f"focused desktop {args.desktop}")
+        return
+
+    if windows is None:
+        if args.list or args.check:
+            raise SystemExit("this side cannot see the desktop windows")
+        message = read_message(args)
+        if message == "":
+            raise SystemExit("refusing to send an empty message")
+        if args.all and args.to:
+            raise SystemExit("use --to or --all, not both")
+        origin = seat_name(args.sender) or self_agent(ancestors())
+        if args.all:
+            target_name = "*"
+        else:
+            target_name = args.to or PAIR.get(origin or "")
+            if target_name not in AGENTS:
+                raise SystemExit(WHICH)
+        enqueue(target_name, message, wake=not args.quiet, sender=args.sender)
+        return
+
+    if args.all and args.to:
+        raise SystemExit("use --to or --all, not both")
+
+    # HOST PATH: we can see windows. Find our own window so we never type into it.
+    self_window = self_window_of(windows, ancestors())
+    if args.list:
+        show_list(windows, self_window)
+        return
+
+    origin = resolve_sender(args.sender, self_window, ancestors())
+    origin_name = origin if origin in AGENTS else ""
+    if args.all:
+        targets = room_windows(windows, origin_name, self_window)
+        seats = [name for name in AGENTS if name != origin_name]
+        seat = "*"
+    else:
+        self_window, targets = choose_target(windows, ancestors(), args.to)
+        if args.to:
+            seat = args.to
+        else:
+            seat = PAIR.get(origin_name, "")
+        seats = [seat] if seat in AGENTS else []
+        if not seats:
+            raise SystemExit(WHICH)
+
+    if args.check:
+        for target in targets:
+            draft = draft_in_composer(composer_text(target), target.get("agent"))
+            state = "busy" if is_busy(target.get("title") or "") else "idle"
+            print(f"target {seat if seat != '*' else target['agent']} {target['address']} ws={workspace_label(target)} {state}")
+            print("composer empty" if not draft else f"composer has text: {draft}")
+        if not targets:
+            print("no windows to type into")
+        return
+
+    message = read_message(args)
+    if message == "":
+        raise SystemExit("refusing to send an empty message")
+    submit = "none" if args.no_send else args.submit
+    # File it first (permanent record), then type it unless --quiet.
+    file_seats(origin, seats, message, quiet=args.quiet)
+    if not args.quiet:
+        for target in targets:
+            try:
+                type_into(target, typed_body(target, message, origin, seat), submit, args.force)
+            except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
+                print(f"not typed into {target.get('agent')}: {error}", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+        raise SystemExit(str(error))

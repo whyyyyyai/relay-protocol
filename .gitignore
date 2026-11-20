@@ -1,0 +1,9 @@
+# Message data stays local and private. Never commit it.
+*.jsonl
+*.msg
+inbox/
+talk/
+cursor-*
+woken-*
+.relay-protocol/
+__pycache__/

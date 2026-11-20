@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""agent-chat: a tiny local chat room for the AI agents and humans on this machine.
+
+Storage is one append-only JSONL file (one message per line):
+    {"ts": "2026-11-16T19:30:05.123Z", "sender": "Claude Code", "room": "general", "text": "hi"}
+
+Message ids are line numbers (1-based) and never change, so `read --since ID` works.
+Python 3 standard library only.
+"""
+
+# =============================================================================
+# agent-chat: how this program works (read this first)
+# =============================================================================
+#
+# WHAT IT IS
+#   A shared chat room ("forum") that the agents and people on this computer
+#   can all post to and read. Unlike relay-protocol, it never types into
+#   anyone's window: you post, and others read when they choose to.
+#
+#   Agents use the commands:      People can use the full-screen chat (TUI):
+#     agent-chat say --as codex "hi"   agent-chat
+#     agent-chat read --last 20        (type and press Enter; /help for commands)
+#     agent-chat tail   (live)
+#
+# WHERE MESSAGES ARE KEPT
+#   One plain-text file, by default ~/.local/share/agent-chat/room.jsonl
+#   (override with the AGENT_CHAT_FILE environment variable). Each line is one
+#   message in JSON. Messages are only ever ADDED to the end; nothing is
+#   edited or deleted. A message's id is its line number (1, 2, 3, ...), so
+#   `read --since 12` means "everything after message 12".
+#
+# ROOMS AND MENTIONS
+#   Every message belongs to a room ("general" by default). Writing @name in a
+#   message mentions that person; @all, @everyone and @here mention everyone.
+#   `read --for NAME` shows only messages that mention NAME.
+#
+# SAFE WITH SEVERAL WRITERS AT ONCE
+#   Writers take an exclusive lock on the file (fcntl.flock) before adding a
+#   line, and readers take a shared lock, so two agents posting at the same
+#   moment cannot mix their lines together.
+#
+# HOW THE FILE IS LAID OUT
+#   storage   writing and reading the message file
+#   helpers   names, mentions, times, colours and output formatting
+#   commands  one function per sub-command: say, read, tail, who, rooms, tui
+#   TUI       the interactive full-screen chat (built with curses)
+#   CLI       command-line options, and main()
+#
+# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20;
+# no code was changed when they were added).
+# =============================================================================
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+import zlib
+from datetime import datetime, timedelta, timezone
+
+# Where messages are stored unless $AGENT_CHAT_FILE says otherwise.
+DEFAULT_FILE = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+    "agent-chat", "room.jsonl")
+DEFAULT_ROOM = "general"
+# Longest message allowed, in characters.
+MAX_TEXT = 8000
+# Longest sender name allowed.
+MAX_NAME = 40
+# Invisible control characters. They are stripped before printing so a message cannot mess up your terminal.
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Any @mention at all, used only to highlight it when printing.
+GENERIC_MENTION_RE = re.compile(r"(?<![\w@])@[\w.-]*\w")
+
+
+def chat_file():
+    """Path of the message file: $AGENT_CHAT_FILE if set, otherwise DEFAULT_FILE."""
+    return os.environ.get("AGENT_CHAT_FILE") or DEFAULT_FILE
+
+
+def die(msg, code=2):
+    """Print an error message and exit (exit code 2 by default)."""
+    print(f"agent-chat: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- storage
+
+def append_message(sender, text, room=DEFAULT_ROOM, path=None):
+    """Append one message under an exclusive flock. Returns its id (line number)."""
+    path = path or chat_file()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    msg = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "sender": sender,
+        "room": room,
+        "text": text,
+    }
+    line = json.dumps(msg, ensure_ascii=False) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            # Count the lines already in the file: the new message's id is that
+            # count + 1. We hold the lock, so nobody can add a line meanwhile.
+            with open(path, "rb") as f:
+                newlines = 0
+                last = b"\n"
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    newlines += chunk.count(b"\n")
+                    last = chunk[-1:]
+            data = line.encode("utf-8")
+            if last != b"\n":  # repair a torn last line from a crashed non-locking writer
+                data = b"\n" + data
+                newlines += 1
+            os.write(fd, data)
+            return newlines + 1
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def parse_line(raw, msg_id):
+    """Turn one raw line from the file into a message dict, or None if broken.
+
+    Adds the "id" key, and fills in defaults for missing fields so the rest
+    of the program can rely on sender, room, ts and text all being strings.
+    """
+    try:
+        m = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(m, dict) or "text" not in m:
+        return None
+    m["id"] = msg_id
+    m.setdefault("sender", "?")
+    m.setdefault("room", DEFAULT_ROOM)
+    m.setdefault("ts", "")
+    m["sender"] = str(m["sender"])
+    m["room"] = str(m["room"])
+    m["text"] = str(m["text"])
+    return m
+
+
+class Reader:
+    """Incrementally reads complete lines from the chat file (handles growth, truncation, absence)."""
+
+    def __init__(self, path=None):
+        """offset:  how many bytes of the file have been read so far
+        next_id: the id the next line will get (ids are line numbers)
+        buf:     the start of a line that has not been fully written yet
+        """
+        self.path = path or chat_file()
+        self.offset = 0
+        self.next_id = 1
+        self.buf = b""
+
+    def poll(self):
+        """Return the messages added since the last call (all of them the first time).
+
+        If the file got SHORTER, it was replaced, so start again from the top.
+        A line without its final newline is kept in `buf` until it is complete.
+        """
+        out = []
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return out
+        if size < self.offset:  # file was truncated/replaced: start over
+            self.offset, self.next_id, self.buf = 0, 1, b""
+        if size == self.offset:
+            return out
+        with open(self.path, "rb") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                f.seek(self.offset)
+                chunk = f.read()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self.offset += len(chunk)
+        data = self.buf + chunk
+        lines = data.split(b"\n")
+        self.buf = lines.pop()  # incomplete trailing line (if any)
+        for raw in lines:
+            m = parse_line(raw, self.next_id) if raw.strip() else None
+            self.next_id += 1
+            if m:
+                out.append(m)
+        return out
+
+
+def load_all(path=None):
+    """Read and return every message in the file."""
+    return Reader(path).poll()
+
+
+# ---------------------------------------------------------------- helpers
+
+def norm_name(name):
+    """Tidy a sender name: one space between words, no control characters, at most MAX_NAME long."""
+    name = CTRL_RE.sub("", " ".join(str(name).split()))
+    return name[:MAX_NAME]
+
+
+def mention_re(name):
+    """Build a pattern that finds @mentions of `name`, plus @all/@everyone/@here.
+
+    Spaces, dots, dashes and underscores in the name are optional, so for
+    "Claude Code" it matches @ClaudeCode, @claude-code and @claude_code.
+    """
+    parts = [p for p in re.split(r"[\s_.-]+", name.strip()) if p]
+    if not parts:
+        return None
+    pat = r"[\s_.-]?".join(re.escape(p) for p in parts)
+    return re.compile(r"(?<![\w@])@(?:" + pat + r"|all|everyone|here)(?![\w])", re.I)
+
+
+def mentions(msg, name_re):
+    """True if message `msg` mentions the name that `name_re` was built for."""
+    return bool(name_re and name_re.search(msg["text"]))
+
+
+def parse_ts(ts):
+    """Turn a stored timestamp string into a datetime (UTC if no zone is given), or None."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, AttributeError):
+        return None
+
+
+def local_time(ts, fmt="%Y-%m-%d %H:%M:%S"):
+    """Format a stored timestamp in this computer's local time zone."""
+    dt = parse_ts(ts)
+    return dt.astimezone().strftime(fmt) if dt else "?"
+
+
+def clean(text):
+    """Make text safe to print: tabs become spaces, control characters are removed."""
+    return CTRL_RE.sub("", text.replace("\t", "    ").replace("\r", ""))
+
+
+def since_filter(spec):
+    """--since accepts a message id (12), a duration (90s, 10m, 2h, 1d) or an ISO timestamp."""
+    spec = spec.strip()
+    if spec.isdigit():
+        n = int(spec)
+        return lambda m: m["id"] > n
+    dm = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd])", spec, re.I)
+    if dm:
+        secs = float(dm.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[dm.group(2).lower()]
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=secs)
+    else:
+        try:
+            cutoff = datetime.fromisoformat(spec.replace("Z", "+00:00"))
+        except ValueError:
+            die(f"--since: expected a message id, a duration like 10m/2h/1d, or an ISO time, got {spec!r}")
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.astimezone()
+    return lambda m: (parse_ts(m["ts"]) or cutoff) > cutoff
+
+
+# Terminal colour codes. Each sender always gets the same colour (see color_index).
+ANSI_COLORS = [31, 32, 33, 34, 35, 36, 91, 92, 93, 94, 95, 96]
+
+
+def color_index(name, n):
+    """Pick a colour number for `name`. The same name always gets the same colour."""
+    return zlib.crc32(name.lower().encode("utf-8")) % n
+
+
+def use_color(args):
+    """True if output should be coloured (a real terminal, and colour not turned off)."""
+    if getattr(args, "no_color", False) or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
+def format_plain(m, color=False, me_re=None):
+    """Format one message for the terminal: "#id time [room] sender: text".
+
+    With colour on, the sender is coloured, @mentions are bold, and a
+    message that mentions you starts with a yellow ">".
+    """
+    head = f"#{m['id']} {local_time(m['ts'])} [{clean(m['room'])}] "
+    sender = clean(m["sender"])
+    lines = clean(m["text"]).split("\n")
+    body = ("\n" + " " * 4).join(lines)
+    if not color:
+        return f"{head}{sender}: {body}"
+    c = ANSI_COLORS[color_index(sender, len(ANSI_COLORS))]
+    body = GENERIC_MENTION_RE.sub(lambda x: f"\x1b[1m{x.group(0)}\x1b[22m", body)
+    line = f"\x1b[2m{head}\x1b[22m\x1b[1;{c}m{sender}\x1b[0m: {body}"
+    if mentions(m, me_re):
+        line = f"\x1b[43;30m>\x1b[0m " + line
+    return line
+
+
+def emit(msgs, args):
+    """Print messages, one per line, as text or as JSON (with --json)."""
+    color = use_color(args)
+    me = getattr(args, "for_name", None) or os.environ.get("AGENT_CHAT_NAME")
+    me_re = mention_re(me) if me else None
+    out = sys.stdout
+    for m in msgs:
+        if args.json:
+            out.write(json.dumps(m, ensure_ascii=False) + "\n")
+        else:
+            out.write(format_plain(m, color, me_re) + "\n")
+    out.flush()
+
+
+def matches(m, args):
+    """True if message `m` passes the --room, --for and --from filters."""
+    if args.room and m["room"] != args.room:
+        return False
+    if getattr(args, "for_name", None) and not mentions(m, args._for_re):
+        return False
+    if getattr(args, "sender", None) and m["sender"].lower() != args.sender.lower():
+        return False
+    return True
+
+
+def resolve_name(args, required=True):
+    """Work out who is posting: --as, then $AGENT_CHAT_NAME.
+
+    If not required (the TUI), falls back to your login name. Exits with an
+    error if no name can be found.
+    """
+    name = getattr(args, "as_name", None) or os.environ.get("AGENT_CHAT_NAME")
+    if not name and not required:
+        name = os.environ.get("USER") or "human"
+    if not name:
+        die('who are you? pass --as "NAME" (or set AGENT_CHAT_NAME)')
+    name = norm_name(name)
+    if not name:
+        die("sender name is empty")
+    return name
+
+
+def valid_room(room):
+    """Check a room name (letters, digits, _ . - ; up to 40). A leading # is dropped."""
+    room = (room or DEFAULT_ROOM).strip().lstrip("#")
+    if not re.fullmatch(r"[\w.-]{1,40}", room):
+        die(f"bad room name {room!r} (letters, digits, _ . - only)")
+    return room
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_say(args):
+    """`agent-chat say`: post one message, taken from the arguments or piped in."""
+    name = resolve_name(args)
+    room = valid_room(args.room)
+    if args.message:
+        text = " ".join(args.message)
+        if text == "-":
+            text = sys.stdin.read()
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        die('no message: agent-chat say --as NAME "message"   (or pipe text on stdin)')
+    text = text.strip("\n").rstrip()
+    if not text.strip():
+        die("message is empty")
+    if len(text) > MAX_TEXT:
+        die(f"message too long ({len(text)} chars, max {MAX_TEXT}); please keep it short")
+    mid = append_message(name, text, room)
+    if not args.quiet:
+        print(f"posted #{mid} to [{room}] as {name}")
+
+
+def prep_filters(args):
+    """Check the --room filter and build the --for mention pattern before filtering."""
+    if args.room:
+        args.room = valid_room(args.room)
+    args._for_re = mention_re(args.for_name) if getattr(args, "for_name", None) else None
+
+
+def cmd_read(args):
+    """`agent-chat read`: print matching messages (by default the last 20) and exit."""
+    prep_filters(args)
+    msgs = [m for m in load_all() if matches(m, args)]
+    if args.since:
+        f = since_filter(args.since)
+        msgs = [m for m in msgs if f(m)]
+    if args.last is not None:
+        msgs = msgs[-args.last:] if args.last > 0 else []
+    elif not args.since:
+        msgs = msgs[-20:]
+    emit(msgs, args)
+
+
+def cmd_tail(args):
+    """`agent-chat tail`: print the last few messages, then keep printing new ones until Ctrl-C."""
+    prep_filters(args)
+    r = Reader()
+    first = [m for m in r.poll() if matches(m, args)]
+    if args.last:
+        emit(first[-args.last:], args)
+    try:
+        while True:
+            new = [m for m in r.poll() if matches(m, args)]
+            if new:
+                emit(new, args)
+            time.sleep(args.interval)
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+
+def cmd_who(args):
+    """`agent-chat who`: list everyone who posted in the last N minutes, newest first."""
+    prep_filters(args)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=args.minutes)
+    seen = {}
+    for m in load_all():
+        if args.room and m["room"] != args.room:
+            continue
+        dt = parse_ts(m["ts"])
+        if not dt or dt < cutoff:
+            continue
+        s = seen.setdefault(m["sender"], {"sender": m["sender"], "count": 0, "last": m["ts"], "rooms": set()})
+        s["count"] += 1
+        s["last"] = m["ts"]
+        s["rooms"].add(m["room"])
+    rows = sorted(seen.values(), key=lambda s: s["last"], reverse=True)
+    if args.json:
+        for s in rows:
+            print(json.dumps({**s, "rooms": sorted(s["rooms"])}, ensure_ascii=False))
+        return
+    for s in rows:
+        rooms = ",".join(sorted(s["rooms"]))
+        print(f"{clean(s['sender'])}\tlast {local_time(s['last'], '%H:%M:%S')}\t{s['count']} msg\t[{rooms}]")
+
+
+def cmd_rooms(args):
+    """`agent-chat rooms`: list every room with its message count and last activity."""
+    counts = {}
+    for m in load_all():
+        c = counts.setdefault(m["room"], [0, ""])
+        c[0] += 1
+        c[1] = m["ts"]
+    for room, (n, last) in sorted(counts.items(), key=lambda kv: kv[1][1], reverse=True):
+        print(f"{room}\t{n} msg\tlast {local_time(last)}")
+
+
+def cmd_tui(args):
+    """`agent-chat` / `agent-chat tui`: open the full-screen interactive chat."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("the TUI needs an interactive terminal; agents should use `say`, `read`, `tail` (see --help)")
+    name = resolve_name(args, required=False)
+    room = valid_room(args.room)
+    os.environ.setdefault("ESCDELAY", "25")
+    import curses
+    tui = Tui(curses, name, room)
+    try:
+        curses.wrapper(tui.run)
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- TUI
+
+# One-line help shown in the status bar when you type /help.
+HELP = ("/room NAME switch room · /rooms · /who · /nick NAME · /quit   "
+        "PgUp/PgDn scroll · Ctrl-U clear · Ctrl-W del word")
+
+
+class Tui:
+    """The full-screen chat for people.
+
+    Layout: a header line, the messages of the current room, a status line,
+    and the line you type on. Built on curses (Python's terminal-screen
+    library).
+    """
+    def __init__(self, curses, name, room):
+        """Set up starting state: who you are, which room, what you have typed, and scrolling."""
+        self.c = curses
+        self.name = name
+        self.room = room
+        self.reader = Reader()
+        self.msgs = []
+        self.buf = ""
+        self.pos = 0
+        self.scroll = 0          # display lines scrolled up from the bottom
+        self.status = "Type a message and press Enter. /help for commands."
+        self.status_until = time.time() + 6
+        self.unseen = 0
+        self.history = []
+        self.hist_i = None
+
+    # -- setup
+    def colors(self):
+        """Choose colours and text styles, falling back to bold/underline if the terminal has no colour."""
+        c = self.c
+        self.name_attrs = [c.A_BOLD]
+        self.dim = c.A_DIM
+        self.me_attr = c.A_BOLD | c.A_REVERSE
+        self.head_attr = c.A_REVERSE
+        self.ment_attr = c.A_BOLD | c.A_UNDERLINE
+        if not c.has_colors():
+            return
+        c.start_color()
+        try:
+            c.use_default_colors()
+            bg = -1
+        except c.error:
+            bg = c.COLOR_BLACK
+        palette = [c.COLOR_RED, c.COLOR_GREEN, c.COLOR_YELLOW, c.COLOR_BLUE, c.COLOR_MAGENTA, c.COLOR_CYAN]
+        self.name_attrs = []
+        for i, col in enumerate(palette, start=1):
+            c.init_pair(i, col, bg)
+            self.name_attrs.append(c.color_pair(i) | c.A_BOLD)
+        c.init_pair(7, c.COLOR_BLACK, c.COLOR_YELLOW)
+        self.me_attr = c.color_pair(7) | c.A_BOLD
+        c.init_pair(8, c.COLOR_BLACK, c.COLOR_CYAN)
+        self.head_attr = c.color_pair(8) | c.A_BOLD
+        c.init_pair(9, c.COLOR_YELLOW, bg)
+        self.ment_attr = c.color_pair(9) | c.A_BOLD
+
+    def name_attr(self, sender):
+        """The colour and style used for `sender`'s name."""
+        return self.name_attrs[color_index(sender, len(self.name_attrs))]
+
+    def flash(self, text, secs=6):
+        """Show `text` in the status line for `secs` seconds."""
+        self.status, self.status_until = text, time.time() + secs
+
+    # -- main loop
+    def run(self, scr):
+        """The main loop: check for new messages, redraw, wait for a key, repeat.
+
+        Ends when key() returns False (on /quit, or Ctrl-D on an empty line).
+        """
+        c = self.c
+        self.scr = scr
+        self.colors()
+        try:
+            c.curs_set(1)
+        except c.error:
+            pass
+        scr.keypad(True)
+        # Wait at most 0.25 s for a key press, so new messages show up even while you are idle.
+        scr.timeout(250)
+        self.me_re = mention_re(self.name)
+        self.msgs = self.reader.poll()
+        while True:
+            new = self.reader.poll()
+            if new:
+                self.msgs.extend(new)
+                here = [m for m in new if m["room"] == self.room]
+                if self.scroll:
+                    self.unseen += len(here)
+                # Someone mentioned you: beep, and if it was in another room say where.
+                pinged = [m for m in new if m["sender"] != self.name and mentions(m, self.me_re)]
+                if pinged:
+                    try:
+                        c.beep()
+                    except c.error:
+                        pass
+                    elsewhere = [m for m in pinged if m["room"] != self.room]
+                    if elsewhere:
+                        m = elsewhere[-1]
+                        self.flash(f"@ mention from {m['sender']} in #{m['room']} (/room {m['room']})", 10)
+            self.draw()
+            try:
+                ch = scr.get_wch()
+            except c.error:
+                continue
+            if self.key(ch) is False:
+                return
+
+    def key(self, ch):
+        """Handle one key press. Returns False to quit, otherwise True.
+
+        Typing edits the input line. Enter sends it. Up/Down go through your
+        past messages. PgUp/PgDn scroll. Ctrl-U clears the line, Ctrl-W
+        deletes a word, Ctrl-A/Ctrl-E jump to the start/end.
+        """
+        c = self.c
+        if isinstance(ch, str):
+            o = ord(ch)
+            if ch in ("\n", "\r"):
+                return self.submit()
+            if o in (8, 127):
+                if self.pos:
+                    self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
+                    self.pos -= 1
+            elif o == 21:      # Ctrl-U
+                self.buf, self.pos = "", 0
+            elif o == 23:      # Ctrl-W
+                left = self.buf[:self.pos].rstrip()
+                left = left[:left.rfind(" ") + 1] if " " in left else ""
+                self.buf, self.pos = left + self.buf[self.pos:], len(left)
+            elif o == 1:       # Ctrl-A
+                self.pos = 0
+            elif o == 5:       # Ctrl-E
+                self.pos = len(self.buf)
+            elif o == 4 and not self.buf:  # Ctrl-D on empty line
+                return False
+            elif o == 12:      # Ctrl-L
+                self.scr.clear()
+            elif o == 27:
+                pass
+            elif o >= 32:
+                self.buf = self.buf[:self.pos] + ch + self.buf[self.pos:]
+                self.pos += 1
+            return True
+        if ch in (c.KEY_BACKSPACE,):
+            return self.key("\x7f")
+        if ch == c.KEY_DC:
+            self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+        elif ch == c.KEY_LEFT:
+            self.pos = max(0, self.pos - 1)
+        elif ch == c.KEY_RIGHT:
+            self.pos = min(len(self.buf), self.pos + 1)
+        elif ch == c.KEY_HOME:
+            self.pos = 0
+        elif ch == c.KEY_END:
+            self.pos = len(self.buf)
+        elif ch == c.KEY_UP and self.history:
+            self.hist_i = len(self.history) - 1 if self.hist_i is None else max(0, self.hist_i - 1)
+            self.buf = self.history[self.hist_i]
+            self.pos = len(self.buf)
+        elif ch == c.KEY_DOWN and self.hist_i is not None:
+            self.hist_i += 1
+            if self.hist_i >= len(self.history):
+                self.hist_i, self.buf = None, ""
+            else:
+                self.buf = self.history[self.hist_i]
+            self.pos = len(self.buf)
+        elif ch == c.KEY_PPAGE:
+            self.scroll += max(1, self.log_h - 2)
+        elif ch == c.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - max(1, self.log_h - 2))
+            if not self.scroll:
+                self.unseen = 0
+        elif ch == c.KEY_RESIZE:
+            self.scr.clear()
+        return True
+
+    def submit(self):
+        """Send what is on the input line.
+
+        A line starting with "/" is a command (see command()). To send a
+        message that really starts with "/", begin it with "//".
+        """
+        text = self.buf.strip()
+        self.buf, self.pos, self.hist_i = "", 0, None
+        if not text:
+            return True
+        self.history.append(text)
+        if text.startswith("/") and not text.startswith("//"):
+            return self.command(text)
+        if text.startswith("//"):
+            text = text[1:]
+        try:
+            append_message(self.name, text[:MAX_TEXT], self.room)
+        except OSError as e:
+            self.flash(f"could not post: {e}")
+        self.scroll = self.unseen = 0
+        return True
+
+    def command(self, text):
+        """Run a slash command: /quit, /help, /room NAME, /rooms, /who, /nick NAME."""
+        cmd, _, arg = text[1:].partition(" ")
+        arg = arg.strip()
+        cmd = cmd.lower()
+        if cmd in ("q", "quit", "exit"):
+            return False
+        if cmd in ("h", "help", "?"):
+            self.flash(HELP, 15)
+        elif cmd in ("room", "join", "j"):
+            r = arg.lstrip("#")
+            if re.fullmatch(r"[\w.-]{1,40}", r):
+                self.room, self.scroll, self.unseen = r, 0, 0
+                self.flash(f"now in #{r}")
+            else:
+                self.flash("usage: /room NAME")
+        elif cmd == "rooms":
+            counts = {}
+            for m in self.msgs:
+                counts[m["room"]] = counts.get(m["room"], 0) + 1
+            self.flash("rooms: " + (", ".join(f"#{k} ({v})" for k, v in counts.items()) or "none yet"), 12)
+        elif cmd == "who":
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+            names = []
+            for m in reversed(self.msgs):
+                dt = parse_ts(m["ts"])
+                if not dt or dt < cutoff:
+                    break
+                if m["sender"] not in names:
+                    names.append(m["sender"])
+            self.flash("active (30 min): " + (", ".join(names) or "nobody"), 12)
+        elif cmd == "nick":
+            n = norm_name(arg)
+            if n:
+                self.name, self.me_re = n, mention_re(n)
+                self.flash(f"you are now {n}")
+            else:
+                self.flash("usage: /nick NAME")
+        else:
+            self.flash(f"unknown command /{cmd} — /help (start with // to send a literal /)")
+        return True
+
+    # -- drawing
+    def wrap(self, m, width):
+        """Return list of display lines; each line is a list of (text, attr) segments."""
+        t = local_time(m["ts"], "%H:%M")
+        sender = clean(m["sender"])
+        prefix = [(t + " ", self.dim), (sender, self.name_attr(sender)), (": ", 0)]
+        plen = len(t) + 1 + len(sender) + 2
+        indent = 6 if plen > width // 2 else plen
+        text = clean(m["text"])
+        # mention spans
+        spans = []
+        is_me = self.me_re and m["sender"] != self.name and self.me_re.search(text)
+        for rx, attr in ((GENERIC_MENTION_RE, self.ment_attr), (self.me_re, self.me_attr)):
+            if rx:
+                for x in rx.finditer(text):
+                    spans.append((x.start(), x.end(), attr))
+        attrs = [0] * len(text)
+        for s, e, a in spans:
+            for i in range(s, e):
+                attrs[i] = a
+        lines, cur, col = [], list(prefix), plen
+        i = 0
+        words = re.finditer(r"\n|[^\S\n]+|[^\s]+", text)
+        for w in words:
+            tok = w.group(0)
+            s = w.start()
+            if tok == "\n":
+                lines.append(cur)
+                cur, col = [(" " * indent, 0)], indent
+                continue
+            if tok.isspace():
+                if col + len(tok) <= width and col > indent:
+                    cur.append((tok, 0))
+                    col += len(tok)
+                continue
+            if col + len(tok) > width and col > indent:
+                lines.append(cur)
+                cur, col = [(" " * indent, 0)], indent
+            while tok:
+                room = max(1, width - col)
+                piece, tok = tok[:room], tok[room:]
+                # split piece by attr runs
+                j = 0
+                while j < len(piece):
+                    a = attrs[s + j]
+                    k = j
+                    while k < len(piece) and attrs[s + k] == a:
+                        k += 1
+                    cur.append((piece[j:k], a))
+                    j = k
+                s += len(piece)
+                col += len(piece)
+                if tok:
+                    lines.append(cur)
+                    cur, col = [(" " * indent, 0)], indent
+        lines.append(cur)
+        if is_me:
+            lines = [[("▌", self.me_attr)] + ln for ln in lines]
+        return lines
+
+    def put(self, y, x, text, attr=0):
+        """Write text on screen at row y, column x, cut to fit, ignoring off-screen errors."""
+        h, w = self.scr.getmaxyx()
+        if y >= h or x >= w:
+            return
+        try:
+            self.scr.addnstr(y, x, text, max(0, w - x - (1 if y == h - 1 else 0)), attr)
+        except self.c.error:
+            pass
+
+    def draw(self):
+        """Redraw the whole screen.
+
+        Messages are built from the newest backwards, only as many as fit
+        (plus how far you have scrolled up).
+        """
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 4 or w < 20:
+            self.put(0, 0, "window too small")
+            scr.refresh()
+            return
+        self.log_h = h - 3
+        width = w - 1
+        # header
+        head = f" agent-chat  #{self.room}  ·  you are {self.name}  ·  /help "
+        self.put(0, 0, head.ljust(w), self.head_attr)
+        # log: build from bottom up only as much as needed
+        need = self.log_h + self.scroll
+        out = []
+        for m in reversed(self.msgs):
+            if m["room"] != self.room:
+                continue
+            out[:0] = self.wrap(m, width - 1)
+            if len(out) >= need:
+                break
+        max_scroll = max(0, len(out) - self.log_h)
+        self.scroll = min(self.scroll, max_scroll)
+        end = len(out) - self.scroll
+        visible = out[max(0, end - self.log_h):end]
+        top = 1 + self.log_h - len(visible)
+        if not out:
+            self.put(1 + self.log_h // 2, max(0, (w - 30) // 2), f"no messages in #{self.room} yet", self.dim)
+        for row, segs in enumerate(visible):
+            x = 0
+            for text, attr in segs:
+                self.put(top + row, x, text, attr)
+                x += len(text)
+        # status / separator line
+        sep_y = h - 2
+        if self.scroll:
+            status = f"-- scrolled up ({self.unseen} new below) — PgDn to return --"
+        elif time.time() < self.status_until:
+            status = self.status
+        else:
+            status = ""
+        self.put(sep_y, 0, "─" * w, self.dim)
+        if status:
+            self.put(sep_y, 2, f" {status} "[: w - 4], self.dim | self.c.A_BOLD)
+        # input line
+        prompt = f"{self.name}> "
+        avail = max(1, w - len(prompt) - 1)
+        start = max(0, self.pos - avail + 1)
+        self.put(h - 1, 0, prompt, self.name_attr(self.name))
+        self.put(h - 1, len(prompt), self.buf[start:start + avail])
+        try:
+            scr.move(h - 1, min(w - 1, len(prompt) + self.pos - start))
+        except self.c.error:
+            pass
+        scr.refresh()
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    """Define every sub-command and option, and the --help text."""
+    p = argparse.ArgumentParser(
+        prog="agent-chat",
+        description="Tiny local chat room for the agents and humans on this machine.",
+        epilog=("examples:\n"
+                '  agent-chat say --as "Claude Code" "hello @all"\n'
+                '  echo "build finished" | agent-chat say --as codex\n'
+                "  agent-chat read --last 20\n"
+                '  agent-chat read --for "Claude Code" --since 2h\n'
+                "  agent-chat tail\n"
+                "  agent-chat                  # interactive chat (humans)\n\n"
+                f"file: $AGENT_CHAT_FILE or {DEFAULT_FILE}\n"
+                "name: --as NAME or $AGENT_CHAT_NAME"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    s = sub.add_parser("say", help="post a message (text as args, or on stdin)")
+    s.add_argument("--as", dest="as_name", metavar="NAME", help="who you are (or $AGENT_CHAT_NAME)")
+    s.add_argument("--room", "-r", default=DEFAULT_ROOM, help="room (default: general)")
+    s.add_argument("--quiet", "-q", action="store_true", help="print nothing on success")
+    s.add_argument("message", nargs="*", help="message text; omit or use - to read stdin")
+    s.set_defaults(func=cmd_say)
+
+    # Filters shared by `read` and `tail`.
+    def common(sp):
+        sp.add_argument("--room", "-r", help="only this room (default: all rooms)")
+        sp.add_argument("--for", dest="for_name", metavar="NAME",
+                        help="only messages mentioning @NAME (or @all/@here/@everyone)")
+        sp.add_argument("--from", dest="sender", metavar="NAME", help="only messages sent by NAME")
+        sp.add_argument("--json", action="store_true", help="output JSON lines (adds an 'id' field)")
+        sp.add_argument("--no-color", action="store_true", help="disable colours")
+
+    r = sub.add_parser("read", help="print recent messages")
+    r.add_argument("--last", "-n", type=int, metavar="N", help="last N messages (default 20)")
+    r.add_argument("--since", "-s", metavar="N",
+                   help="messages after id N, or newer than a duration (10m, 2h, 1d) or ISO time")
+    common(r)
+    r.set_defaults(func=cmd_read)
+
+    t = sub.add_parser("tail", help="follow new messages live (Ctrl-C to stop)")
+    t.add_argument("--last", "-n", type=int, default=10, metavar="N", help="show last N first (default 10)")
+    t.add_argument("--interval", type=float, default=0.5, help=argparse.SUPPRESS)
+    common(t)
+    t.set_defaults(func=cmd_tail)
+
+    w = sub.add_parser("who", help="senders seen recently (default: last 30 min)")
+    w.add_argument("--minutes", "-m", type=float, default=30)
+    w.add_argument("--room", "-r")
+    w.add_argument("--json", action="store_true")
+    w.set_defaults(func=cmd_who)
+
+    ro = sub.add_parser("rooms", help="list rooms with message counts")
+    ro.set_defaults(func=cmd_rooms)
+
+    u = sub.add_parser("tui", help="interactive chat room (default when run with no args)")
+    u.add_argument("--as", dest="as_name", metavar="NAME", help="your name (default $AGENT_CHAT_NAME or $USER)")
+    u.add_argument("--room", "-r", default=DEFAULT_ROOM)
+    u.set_defaults(func=cmd_tui)
+    return p
+
+
+def main(argv=None):
+    """Entry point. With no arguments in a terminal, open the TUI; when piped,
+    print help. Otherwise run the chosen sub-command.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    if not argv:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            argv = ["tui"]
+        else:
+            parser.print_help()
+            return 0
+    # No sub-command given, e.g. `agent-chat --as Joseph`: treat it as the TUI.
+    elif argv[0] in ("--as", "--room", "-r") or argv[0].startswith(("--as=", "--room=")):
+        argv = ["tui"] + argv  # `agent-chat --as NAME` opens the TUI
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+    except OSError as e:
+        die(str(e), 1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

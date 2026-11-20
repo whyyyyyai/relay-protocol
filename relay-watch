@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""relay-watch: live view of relay-protocol.
+
+Shows whether relay-protocol.service is running, the queued inbox size,
+and every note as it is filed, until you press Ctrl-C.
+
+Written by: Claude (2026-11-20)
+"""
+
+# How to use it:
+#   relay-watch        show the last 5 notes, then follow new ones live
+#   relay-watch 20     show the last 20 first
+#
+# It only READS. It never sends, files or deletes anything, so it is safe to
+# leave running. It checks once a second for new lines at the end of
+# ~/Work/.relay-protocol/talk/log.jsonl (the file relay-protocol writes every
+# message to), and prints the service state again whenever it changes, or
+# once a minute as a heartbeat.
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+ROOT = Path.home() / "Work/.relay-protocol"
+LOG = ROOT / "talk/log.jsonl"
+INBOX = ROOT / "inbox"
+# How many past notes to show at start-up: the first argument, or 5.
+BACKLOG = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 5
+
+# Terminal colour codes.
+DIM, BOLD, GREEN, RED, CYAN, RESET = "\033[2m", "\033[1m", "\033[32m", "\033[31m", "\033[36m", "\033[0m"
+
+
+def service_state():
+    """Ask systemd whether relay-protocol.service is running: 'active', 'inactive', 'failed', ..."""
+    r = subprocess.run(["systemctl", "--user", "is-active", "relay-protocol.service"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def inbox_count():
+    """How many messages are waiting in the inbox for the service to deliver."""
+    try:
+        return sum(1 for p in INBOX.iterdir() if p.is_file())
+    except OSError:
+        return 0
+
+
+def status_line():
+    """One line: the time, the service state (green when running, red otherwise), and the inbox size."""
+    state = service_state()
+    colour = GREEN if state == "active" else RED
+    return f"{DIM}{time.strftime('%H:%M:%S')}{RESET}  service {colour}{state}{RESET}  ·  queued {inbox_count()}"
+
+
+def show(line):
+    """Print one note from the log: time, sender -> recipient, and the text (cut to 300 characters)."""
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    ts = rec.get("ts", "")[11:19]
+    quiet = f" {DIM}(quiet){RESET}" if rec.get("quiet") else ""
+    head = f"{BOLD}{rec.get('from', '?')}{RESET} → {CYAN}{rec.get('to', '?')}{RESET}{quiet}"
+    msg = " ".join(str(rec.get("message", "")).split())
+    if len(msg) > 300:
+        msg = msg[:297] + "..."
+    print(f"{DIM}{ts}{RESET}  {head}\n          {msg}", flush=True)
+
+
+def main():
+    """Print a header and recent notes, then loop forever printing new notes as they arrive."""
+    print(f"{BOLD}relay-watch{RESET}  {DIM}{LOG}{RESET}")
+    print(status_line(), flush=True)
+    if not LOG.exists():
+        print(f"{RED}No log yet at {LOG}{RESET}")
+    else:
+        lines = LOG.read_text(errors="replace").splitlines()
+        if BACKLOG and lines:
+            print(f"{DIM}--- last {min(BACKLOG, len(lines))} notes ---{RESET}")
+            for line in lines[-BACKLOG:]:
+                show(line)
+        print(f"{DIM}--- live (Ctrl-C to stop) ---{RESET}", flush=True)
+    # pos = how far into the log file we have printed. Start at the end, so only new notes show.
+    pos = LOG.stat().st_size if LOG.exists() else 0
+    last_state, last_beat = service_state(), time.time()
+    while True:
+        time.sleep(1)
+        if LOG.exists():
+            size = LOG.stat().st_size
+            # The file got shorter (it was replaced): start again from the top.
+            if size < pos:
+                pos = 0
+            if size > pos:
+                with LOG.open(errors="replace") as f:
+                    f.seek(pos)
+                    for line in f:
+                        show(line)
+                    pos = f.tell()
+        state = service_state()
+        if state != last_state or time.time() - last_beat > 60:
+            print(status_line(), flush=True)
+            last_state, last_beat = state, time.time()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
