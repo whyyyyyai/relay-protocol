@@ -36,8 +36,8 @@ agents, and no agent claims them alone.
 | --- | --- | --- |
 | `claude/push-courier` (PR #5) | Claude | `push-courier`: pushes sandboxed agents' own branches |
 | `claude/easy-setup` | Claude | `install.sh`, `docs/SETUP.md` |
-| `codex/chat-log-sync` | Codex | chat archive, Discord relay, scheduler back-off |
-| `codex/discord-bot` | Codex | outbound Discord relay |
+| `codex/chat-log-sync` (PR #7) | Codex | chat archive, Discord relay, scheduler back-off |
+| `codex/discord-bot` (PR #6) | Codex | outbound Discord relay |
 
 When one of these is merged, move its row up into the tables above.
 
