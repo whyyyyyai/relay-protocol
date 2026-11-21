@@ -90,6 +90,7 @@ BRANCH_OK = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$")
 
 
 def log(text):
+    """Print one timestamped line (it ends up in the service log)."""
     print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
 
 
@@ -193,6 +194,12 @@ def tell(agent, answer):
 
 
 def handle_waiting(dry_run):
+    """Answer every request file waiting in requests/, oldest name first.
+
+    Each request is moved out once answered: its answer goes to done/, and
+    the agent is told through the relay. A refused request is answered too,
+    with the reason, so the agent never waits on silence.
+    """
     REQUESTS.mkdir(parents=True, exist_ok=True)
     DONE.mkdir(parents=True, exist_ok=True)
     for path in sorted(REQUESTS.glob("*.json")):
@@ -218,6 +225,7 @@ def handle_waiting(dry_run):
 
 
 def main():
+    """Read the options, then look at the requests folder every EVERY seconds."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--once", action="store_true", help="handle waiting requests, then exit")
     parser.add_argument("--dry-run", action="store_true", help="check requests, push nothing")
