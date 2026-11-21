@@ -62,7 +62,7 @@
 #   It is safe to run alongside `relay-protocol --serve`: they share the
 #   woken-<agent> files, so an agent is never reminded twice for one note.
 #
-# Written by: Claude (2026-11-21), from Joseph's design: a local scheduler
+# Written by: Claude (2026-11-21), from the owner's design: a local scheduler
 # with a doubling back-off, so agents don't spend tokens checking.
 # =============================================================================
 

@@ -46,7 +46,7 @@
 #   - Only a branch named after the asking agent: codex can push `codex/...`,
 #     grok can push `grok/...`, and so on. Never main, test or live.
 #   - Pull requests may only go into `test`. Getting from test to main, and
-#     main to live, stays a decision for Joseph (see docs/BRANCHING.md).
+#     main to live, stays a decision for the owner (see docs/BRANCHING.md).
 #   - Never a force push. If GitHub has commits the branch doesn't, it
 #     refuses and says so.
 #   - Before pushing, it scans every line the branch adds for passwords, keys,

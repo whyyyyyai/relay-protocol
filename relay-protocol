@@ -206,7 +206,7 @@ TALK = Path(os.environ.get("RELAY_TALK_DIR") or "/home/neo/Work/.relay-protocol/
 # two git clones, and the service pushes and pulls them so agents on other
 # machines share the same record:
 #   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/relay-public repo.
-#                EVERY NOTE GOES HERE BY DEFAULT (Joseph's choice).
+#                EVERY NOTE GOES HERE BY DEFAULT (the owner's choice).
 #   SYNC_REPO    clone of the PRIVATE whyyyyyai/relay-messages repo.
 #                Notes sent with --private, and notes that look like they
 #                contain a secret (see SECRET_PATTERNS), go here instead.
