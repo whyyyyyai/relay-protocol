@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""scheduler: tell each agent when new relay notes are waiting for it.
+
+  scheduler                 run forever (normally as relay-scheduler.service)
+  scheduler --once          one check, then exit
+  scheduler --dry-run       print what it would type, but type nothing
+  scheduler --min 30 --max 900
+"""
+
+# =============================================================================
+# scheduler: how this program works (read this first)
+# =============================================================================
+#
+# WHAT IT IS FOR
+#   Agents shouldn't spend their own time (and tokens) checking whether
+#   anyone has written to them. This small program does the checking
+#   instead. Only when there IS something new does it type a one-line
+#   reminder into that agent's window, so the agent spends tokens only
+#   when there's real work:
+#
+#     [scheduler] 2 new relay notes for you (from grok, claude). Run: relay-protocol --read
+#
+#   Every reminder is also printed as a line on this program's own output
+#   (and in the service log), so you can see each time it nudged an agent.
+#
+# TWO KINDS OF CHECK
+#   1. LOCAL: every 5 seconds. Free: it only compares file sizes on this
+#      machine, so a note from an agent on the same machine is noticed
+#      within seconds.
+#   2. GITHUB: pulls both relay repos (public and private) to find notes
+#      written on OTHER machines. This uses the network, so it BACKS OFF:
+#        start at --min seconds (default 30);
+#        each check that finds nothing new doubles the wait
+#          (30 s, 1 min, 2 min, 4 min, 8 min ...);
+#        the wait never goes above --max seconds (default 900 = 15 min);
+#        as soon as anything new arrives, the wait drops back to --min.
+#      So it checks often while agents are busy talking, and rarely when
+#      everything is quiet.
+#
+# WHAT COUNTS AS "NEW" FOR AN AGENT
+#   Notes in talk/for-<agent>.jsonl past both:
+#     cursor-<agent>  (what the agent has already read with --read), and
+#     woken-<agent>   (what it has already been reminded about).
+#   Only notes the agent hasn't seen in its window count:
+#     - "quiet" notes (only saved, never typed). Notes from other machines
+#       are always copied in as quiet, so they always count;
+#     - notes relay-protocol tried and FAILED to type (for example because
+#       someone was mid-sentence in that window). It lists their ids in
+#       talk/untyped-<agent>.
+#   A note that was typed in successfully needs no reminder.
+#   After a reminder, woken-<agent> moves to the end of the file, so the
+#   same notes never cause a second reminder.
+#
+# HOW IT FITS WITH relay-protocol
+#   It reuses relay-protocol's own code (it loads the relay-protocol file
+#   that sits next to it): the same sync, the same files, the same safe
+#   typing (it never types over a half-written draft, and puts your
+#   clipboard and window focus back).
+#   It does NOT reopen closed Grok or Codex windows. That is still only
+#   done by `relay-protocol --serve`. If an agent's window is closed, the
+#   reminder waits until it is open again.
+#   It is safe to run alongside `relay-protocol --serve`: they share the
+#   woken-<agent> files, so an agent is never reminded twice for one note.
+#
+# Written by: Claude (2026-11-21), from Joseph's design: a local scheduler
+# with a doubling back-off, so agents don't spend tokens checking.
+# =============================================================================
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# How often the free local check runs, in seconds.
+LOCAL_EVERY = 5
+
+
+def load_relay():
+    """Load relay-protocol as a module so this program uses its exact code.
+
+    Looks next to this file first (the repo, or ~/.local/bin), then on PATH.
+    """
+    here = Path(__file__).resolve().parent / "relay-protocol"
+    path = here if here.exists() else Path(shutil.which("relay-protocol") or "")
+    if not path.is_file():
+        raise SystemExit("scheduler: cannot find relay-protocol next to it or on PATH")
+    loader = importlib.machinery.SourceFileLoader("relay_protocol", str(path))
+    spec = importlib.util.spec_from_loader("relay_protocol", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+relay = load_relay()
+
+
+def log(text):
+    """Print one timestamped line (this is the 'CLI line' for each event)."""
+    print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+
+
+def waiting_notes(agent):
+    """New quiet notes for `agent` that it has neither read nor been reminded about.
+
+    Returns (list of note dicts, length of the mailbox file). The length is
+    what woken-<agent> is set to once the agent has been reminded.
+    """
+    path = relay.TALK / f"for-{agent}.jsonl"
+    data = path.read_text(encoding="utf-8") if path.exists() else ""
+    read_at = relay.cursor_at(relay.TALK / f"cursor-{agent}", len(data))
+    woken_at = relay.cursor_at(relay.TALK / f"woken-{agent}", len(data))
+    # Notes that relay-protocol tried and failed to type into the window.
+    untyped_path = relay.TALK / f"untyped-{agent}"
+    untyped = set(untyped_path.read_text(encoding="utf-8").split()) if untyped_path.exists() else set()
+    notes = []
+    for line in data[max(read_at, woken_at):].splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("quiet") or item.get("id") in untyped:
+            notes.append(item)
+    return notes, len(data)
+
+
+def reminder_text(notes):
+    """The one line typed into the agent's window."""
+    senders = []
+    for note in notes:
+        name = note.get("from") or "unknown"
+        if name not in senders:
+            senders.append(name)
+    count = len(notes)
+    plural = "note" if count == 1 else "notes"
+    return (f"[scheduler] {count} new relay {plural} for you (from {', '.join(senders)}). "
+            "Run: relay-protocol --read")
+
+
+# agent -> the last reason a reminder could not be typed, so a reminder that
+# keeps failing (e.g. while someone is typing in that window) is logged once,
+# not every 5 seconds. It is retried on every check until it gets through.
+_last_problem = {}
+
+
+def remind_all(dry_run):
+    """Remind every agent that has new notes. Returns how many were reminded.
+
+    Runs on every local check. It costs nothing when no notes are waiting:
+    it only reads small files, and looks at the windows only when needed.
+    """
+    if not relay.TALK.is_dir():
+        return 0
+    windows = None
+    reminded = 0
+    for agent in relay.NUDGED:
+        notes, length = waiting_notes(agent)
+        if not notes:
+            continue
+        text = reminder_text(notes)
+        if dry_run:
+            # Nothing is marked as sent in a dry run, so say it once per change.
+            if _last_problem.get(agent) != ("dry", length):
+                log(f"would remind {agent}: {text}")
+                _last_problem[agent] = ("dry", length)
+            reminded += 1
+            continue
+        if windows is None:
+            try:
+                windows = relay.agent_windows()
+            except (subprocess.SubprocessError, OSError, RuntimeError) as error:
+                log(f"cannot see the desktop windows yet: {error}")
+                return reminded
+        chosen = relay.pick_terminal(windows, agent)
+        problem = None
+        if not chosen:
+            problem = "its window isn't open"
+        else:
+            try:
+                relay.type_into(chosen[0], text, "auto", False)
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                # Usually "composer has text": someone is typing there.
+                problem = str(error)
+        if problem:
+            if _last_problem.get(agent) != problem:
+                log(f"{agent} not reminded yet ({problem}); will keep trying")
+                _last_problem[agent] = problem
+            continue
+        _last_problem.pop(agent, None)
+        (relay.TALK / f"woken-{agent}").write_text(str(length))
+        log(f"reminded {agent}: {len(notes)} new note(s)")
+        reminded += 1
+    return reminded
+
+
+def check_github():
+    """Pull both relay repos. Returns how many notes arrived from other machines.
+
+    Returns 0 (and says why) if sync is off or GitHub can't be reached.
+    """
+    if not relay.sync_repos():
+        return 0
+    try:
+        count = relay.sync_once()
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        detail = str(getattr(error, "stderr", "") or error).strip().splitlines()
+        log(f"GitHub check failed, will retry: {detail[-1] if detail else error}")
+        return 0
+    if count:
+        log(f"GitHub: {count} new note(s) from other machines")
+    return count
+
+
+def mailbox_sizes():
+    """Size of every for-<agent>.jsonl file: a free way to notice new local notes."""
+    return {agent: (relay.TALK / f"for-{agent}.jsonl").stat().st_size
+            if (relay.TALK / f"for-{agent}.jsonl").exists() else 0
+            for agent in relay.NUDGED}
+
+
+def run(args):
+    """The main loop: free local checks every 5 s, GitHub checks with back-off."""
+    wait = args.min
+    next_github = 0.0  # check GitHub straight away on start
+    sizes = None
+    log(f"scheduler started: GitHub every {args.min}s, doubling to at most {args.max}s when quiet")
+    while True:
+        now = time.time()
+        found = 0
+        if now >= next_github:
+            found = check_github()
+            # Something arrived: check often again. Nothing: wait twice as long.
+            wait = args.min if found else min(wait * 2, args.max)
+            next_github = time.time() + wait
+            log(f"next GitHub check in {wait}s")
+        current = mailbox_sizes()
+        if sizes is not None and current != sizes and not found:
+            # A note was just sent on this machine, so agents are busy:
+            # check GitHub sooner too, in case replies come from elsewhere.
+            wait = args.min
+            next_github = min(next_github, time.time() + wait)
+        sizes = current
+        remind_all(args.dry_run)
+        if args.once:
+            return
+        time.sleep(LOCAL_EVERY)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--once", action="store_true", help="check once, then exit")
+    parser.add_argument("--dry-run", action="store_true", help="print the reminders, but don't type them or mark them sent")
+    parser.add_argument("--min", type=int, default=30, help="shortest wait between GitHub checks, in seconds (default 30)")
+    parser.add_argument("--max", type=int, default=900, help="longest wait between GitHub checks, in seconds (default 900)")
+    args = parser.parse_args()
+    if args.min < 5 or args.max < args.min:
+        raise SystemExit("need --min of at least 5, and --max no smaller than --min")
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

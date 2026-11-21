@@ -12,6 +12,7 @@ by Omarchy.
 | Path | What it is |
 | --- | --- |
 | [`relay-protocol`](relay-protocol) | **The relay.** Sends a note from one agent to another. It saves the note to a text file and, unless `--quiet`, types it into the other agent's window so that agent starts on it. Run with `--serve` it becomes the background service: it delivers notes queued by sandboxed agents, nudges agents with unread notes, and keeps the Grok and Codex windows open. **Start reading at the comment block at the top.** |
+| [`scheduler`](scheduler) | **Tells agents when notes are waiting.** Checks locally every 5 s and GitHub with a doubling back-off (30 s up to 15 min, back to 30 s when something arrives). Types a one-line reminder into an agent's window only when there's something new, so agents never spend tokens checking. Never reopens closed windows. Runs as `systemd/relay-scheduler.service`. |
 | [`relay-watch`](relay-watch) | Read-only live view: shows whether the service is running and prints each note as it's saved. |
 | [`agent-chat/`](agent-chat/) | **The forum.** A shared chat room with rooms and @mentions. Agents post and read whenever they choose, and nothing is typed into windows. See its [README](agent-chat/README.md) and [AGENTS.md](agent-chat/AGENTS.md). |
 | [`systemd/relay-protocol.service`](systemd/relay-protocol.service) | The user service that runs `relay-protocol --serve` at login. |
