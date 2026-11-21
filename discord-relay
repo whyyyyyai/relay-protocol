@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Forward new agent-chat messages to Discord through a locally configured webhook.
+
+Set DISCORD_WEBHOOK_URL in the service environment. Starts at the current end
+of the room log, forwards only future messages, and never forwards messages
+matching relay-protocol's private-data filter.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader("relay_protocol", str(HERE / "relay-protocol"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+relay = importlib.util.module_from_spec(spec)
+loader.exec_module(relay)
+ROOM = Path(os.environ.get("AGENT_CHAT_FILE") or (Path.home() / ".local/share/agent-chat/room.jsonl"))
+STATE = Path(os.environ.get("DISCORD_RELAY_STATE") or (Path.home() / ".local/state/discord-relay/offset"))
+
+def main():
+    hook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not hook.startswith("https://discord.com/api/webhooks/") and not hook.startswith("https://discordapp.com/api/webhooks/"):
+        raise SystemExit("discord-relay: set DISCORD_WEBHOOK_URL to a Discord webhook in the service environment")
+    try:
+        offset = int(STATE.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        try:
+            offset = ROOM.stat().st_size
+        except OSError:
+            offset = 0
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(str(offset), encoding="ascii")
+    print("discord-relay started; forwarding new public chat messages", flush=True)
+    while True:
+        try:
+            size = ROOM.stat().st_size
+            if size < offset:
+                offset = size
+                STATE.write_text(str(offset), encoding="ascii")
+            if size > offset:
+                with ROOM.open("rb") as stream:
+                    stream.seek(offset)
+                    data = stream.read()
+                lines = data.splitlines(keepends=True)
+                consumed = 0
+                for raw_line in lines:
+                    if not raw_line.endswith(b"\n"):
+                        break
+                    raw = raw_line.rstrip(b"\r\n")
+                    try:
+                        msg = json.loads(raw)
+                        body = str(msg.get("text", ""))
+                        if not body or relay.looks_secret(str(msg.get("sender", "")) + " " + body):
+                            print("discord-relay skipped private-pattern message", flush=True)
+                            continue
+                        content = f"**{msg.get('sender', '?')}** · #{msg.get('room', 'general')}\n{body}"
+                        for start in range(0, len(content), 1900):
+                            payload = json.dumps({"content": content[start:start + 1900]}).encode()
+                            req = urllib.request.Request(hook, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                            with urllib.request.urlopen(req, timeout=15) as response:
+                                response.read()
+                        print(f"Discord: relayed message from {msg.get('sender', '?')}", flush=True)
+                    except (ValueError, KeyError, urllib.error.URLError, TimeoutError) as error:
+                        print(f"discord-relay delivery failed: {error}; stopping to avoid skipping messages", flush=True)
+                        break
+                    consumed += len(raw_line)
+                offset += consumed
+                STATE.write_text(str(offset), encoding="ascii")
+        except OSError as error:
+            print(f"discord-relay waiting for room log: {error}", flush=True)
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
+
+# Written by: Codex

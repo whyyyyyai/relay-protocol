@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Archive agent-chat room messages to the relay GitHub repositories.
+
+Public chat files live under chat/<date>/<room>-<id>.txt. Messages matching
+the relay's private-data filter are written only to the private clone.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import hashlib
+import os
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader("relay_protocol", str(HERE / "relay-protocol"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+relay = importlib.util.module_from_spec(spec)
+loader.exec_module(relay)
+
+ROOM = Path(os.environ.get("AGENT_CHAT_FILE") or (Path.home() / ".local/share/agent-chat/room.jsonl"))
+TALK_LOG = relay.TALK / "log.jsonl"
+RELAY_OFFSET = relay.TALK / "chat-archive-relay-offset"
+
+def archive_relay_log():
+    """Backfill the machine's relay log using stable IDs and privacy routing."""
+    added = 0
+    if not TALK_LOG.exists():
+        return added
+    try:
+        offset = int(RELAY_OFFSET.read_text(encoding="ascii")) if RELAY_OFFSET.exists() else 0
+    except (ValueError, OSError):
+        offset = 0
+    size = TALK_LOG.stat().st_size
+    if size < offset:
+        offset = 0
+    consumed = 0
+    with TALK_LOG.open("rb") as stream:
+        stream.seek(offset)
+        raw_lines = stream.read().splitlines(keepends=True)
+    for raw_line in raw_lines:
+        if not raw_line.endswith(b"\n"):
+            break
+        line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+        try:
+            record = json.loads(line)
+            if not all(record.get(key) for key in ("from", "to", "ts", "message")):
+                continue
+            date = str(record["ts"])[:10]
+            if not re.fullmatch(r"\d{4}-\d\d-\d\d", date):
+                continue
+            stable_id = str(record.get("id") or hashlib.sha256(line.encode()).hexdigest()[:24])
+            record = {**record, "id": stable_id, "host": record.get("host") or relay.HOST}
+            record["private"] = relay.keep_private(str(record["message"]), bool(record.get("private")))
+            repo = relay.repo_for(record["private"])
+            if repo is None:
+                break
+            folder = repo / "messages" / date
+            filename = f"{record['ts'][11:19].replace(':', '')}-{record['from']}-to-{record['to']}-{stable_id}.txt"
+            target = folder / filename
+            if not target.exists():
+                relay.export_message(record)
+                added += 1
+            consumed += len(raw_line)
+        except (ValueError, OSError, TypeError, KeyError):
+            consumed += len(raw_line)
+            continue
+    RELAY_OFFSET.parent.mkdir(parents=True, exist_ok=True)
+    RELAY_OFFSET.write_text(str(offset + consumed), encoding="ascii")
+    return added
+
+def main():
+    count = archive_relay_log()
+    for line_no, line in enumerate(ROOM.read_text(encoding="utf-8").splitlines(), 1) if ROOM.exists() else ():
+        try:
+            msg = json.loads(line)
+            ts = str(msg.get("ts", ""))
+            date = ts[:10]
+            room = re.sub(r"[^A-Za-z0-9_-]", "_", str(msg.get("room", "general")))[:60]
+            if not re.fullmatch(r"\d{4}-\d\d-\d\d", date) or "text" not in msg:
+                continue
+            private = relay.keep_private(str(msg["sender"]) + " " + str(msg["text"]), False)
+            repo = relay.repo_for(private)
+            if repo is None:
+                continue
+            dest = repo / "chat" / date / f"{room}-{line_no:09d}.txt"
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(f"From: {str(msg.get('sender', '?'))[:80]}\nTime: {ts}\nRoom: {room}\nID: {line_no}\nOrigin: {relay.HOST}\n\n{msg['text']}\n", encoding="utf-8")
+            count += 1
+        except (ValueError, OSError, TypeError) as exc:
+            print(f"chat-archive: skipped line {line_no}: {exc}", file=sys.stderr)
+    print(f"chat archive: {count} new message(s) staged", flush=True)
+
+if __name__ == "__main__":
+    main()
+
+# Written by: Codex
