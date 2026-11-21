@@ -39,6 +39,27 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #      presses Enter. That makes the other agent start working on it right
 #      away, as if a person had typed it. A "quiet" note is only filed.
 #
+# GITHUB IS THE SHARED RECORD (added 2026-11-20)
+#   Every message is ALSO saved as a plain-text file in a git clone of a
+#   GitHub repo. That repo is the main record that every machine shares;
+#   the local talk files are this machine's working copy. There are two:
+#     PUBLIC  whyyyyyai/relay-public    (~/Work/relay-public, or set RELAY_PUBLIC_REPO)
+#             EVERY NOTE GOES HERE BY DEFAULT. Anyone can read it.
+#     PRIVATE whyyyyyai/relay-messages  (~/Work/relay-messages, or set RELAY_SYNC_REPO)
+#             Notes sent with --private go here instead. So does any note
+#             that looks like it contains a password, key, token or
+#             sign-in code (SECRET_PATTERNS), with a warning.
+#     - Sending pushes to GitHub straight away, in the background.
+#     - `--read` pulls from GitHub FIRST, then shows unread notes, so notes
+#       sent from other machines appear.
+#     - The service also syncs every 30 seconds, in case a push failed.
+#     - `--note "..."` adds a reasoning entry to the running COMMENTARY
+#       (commentary/<date>.md, public unless --private): a play-by-play of
+#       why things were done, which any agent can add to.
+#   A folder that isn't a git clone is skipped. With neither, sync is off
+#   and everything stays local.
+#   See SECTION 11.
+#
 # THE TWO SIDES: "HOST" AND "SANDBOX"
 #   - The HOST is the normal desktop session. From there this program can see
 #     and control windows through `hyprctl` (Hyprland, the window manager).
@@ -60,6 +81,7 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #        reminder into its window ("Unread quiet notes: N. Run
 #        relay-protocol --read."), at most once every 20 seconds.
 #     c. Delivers every message waiting in the inbox folders.
+#   Separately, in its own thread, it syncs with GitHub every 30 seconds.
 #
 # FILES ON DISK (all plain text, all under ~/Work/.relay-protocol/)
 #   talk/log.jsonl          every message ever filed, one JSON object per line
@@ -68,12 +90,20 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #                           that agent has already read with --read
 #   talk/woken-<agent>      a number: how far the service has already nudged
 #                           that agent, so it does not nudge twice for one note
+#   talk/imported-ids       ids of messages from other machines already copied in
 #   inbox/*.msg             messages waiting for the host service to deliver
-#   /tmp/relay-protocol.lock  stops two copies typing into windows at once
+#   /tmp/relay-protocol.lock       stops two copies typing into windows at once
+#   /tmp/relay-protocol-sync.lock  stops two GitHub syncs running at once
 #
 #   A line in the talk files looks like:
-#     {"from": "grok", "to": "codex", "ts": "2026-11-20T23:14:45",
-#      "message": "the text", "quiet": false}
+#     {"id": "1795216185912303790-boop-4242", "host": "boop", "from": "grok",
+#      "to": "codex", "ts": "2026-11-20T23:14:45", "message": "the text",
+#      "quiet": false}
+#   (Lines written before 2026-11-20 have no "id" or "host".)
+#
+# FILES IN EACH GITHUB REPO (~/Work/relay-public and ~/Work/relay-messages)
+#   messages/<date>/<HHMMSS>-<from>-to-<to>-<id>.txt   one plain-text file per message
+#   commentary/<date>.md                               the running commentary
 #
 # WHO THE "SEATS" ARE
 #   Terminal seats (each has its own terminal window):
@@ -96,8 +126,9 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #   SECTION 8   Typing a note into a window, safely
 #   SECTION 9   Keeping the Grok and Codex windows open
 #   SECTION 10  Nudging agents that have unread quiet notes
-#   SECTION 11  The background service loop (--serve)
-#   SECTION 12  Command-line entry point: what each flag does
+#   SECTION 11  Sharing messages and commentary through GitHub
+#   SECTION 12  The background service loop (--serve)
+#   SECTION 13  Command-line entry point: what each flag does
 #
 # SAFETY HABITS USED THROUGHOUT
 #   - Anything sent to hyprctl is checked against a strict pattern first
@@ -109,8 +140,8 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #   - It saves your clipboard before pasting and puts it back afterwards.
 #   - It puts keyboard focus back on the window you were using.
 #
-# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20;
-# no code was changed when they were added).
+# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20,
+# and the GitHub sync and commentary the same day).
 # =============================================================================
 
 from __future__ import annotations
@@ -120,9 +151,11 @@ import fcntl
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -165,7 +198,45 @@ INBOXES = (
     Path.home() / ".local/share/relay-protocol/inbox",
 )
 # The permanent message record (log.jsonl, for-<agent>.jsonl, cursors).
-TALK = Path("/home/neo/Work/.relay-protocol/talk")
+# RELAY_TALK_DIR can point it elsewhere, e.g. for testing.
+TALK = Path(os.environ.get("RELAY_TALK_DIR") or "/home/neo/Work/.relay-protocol/talk")
+
+# --- GitHub message sync (see SECTION 11) ---
+# Every filed message is also written as its own plain-text file into one of
+# two git clones, and the service pushes and pulls them so agents on other
+# machines share the same record:
+#   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/relay-public repo.
+#                EVERY NOTE GOES HERE BY DEFAULT (Joseph's choice).
+#   SYNC_REPO    clone of the PRIVATE whyyyyyai/relay-messages repo.
+#                Notes sent with --private, and notes that look like they
+#                contain a secret (see SECRET_PATTERNS), go here instead.
+# If a folder is not a git clone, that repo is simply skipped. With neither,
+# everything works locally exactly as before.
+PUBLIC_REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/relay-public"))
+SYNC_REPO = Path(os.environ.get("RELAY_SYNC_REPO") or (Path.home() / "Work/relay-messages"))
+# Text that must never be made public. A note matching any of these is sent
+# to the PRIVATE repo instead, with a warning. This is a safety net, not a
+# guarantee: agents should still never put secrets in notes.
+SECRET_PATTERNS = [
+    re.compile(r"\b(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),  # GitHub tokens
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),                                      # API keys (OpenAI/Anthropic style)
+    re.compile(r"\bxai-[A-Za-z0-9]{20,}"),                                       # xAI keys
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                                          # AWS access keys
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),                            # private keys
+    re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"),                                   # one-time sign-in codes like 54BB-BF2C
+    re.compile(r"(?i)\b(password|passwd|passphrase|api[_ -]?key|secret|token)\s*[:=]\s*\S+"),  # "password: hunter2"
+]
+# This machine's name, made safe for a file name. It is stored on every
+# message ("host") so a machine can tell its own messages from others'.
+HOST = re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "unknown-host"
+# How often the service pushes and pulls, in seconds.
+SYNC_EVERY = 30
+# Ids of messages from OTHER machines already copied into the local talk
+# files, one per line, so each is copied only once. Kept per machine and
+# never synced.
+IMPORTED = TALK / "imported-ids"
+# Lock file so only one sync runs at a time on this machine.
+SYNC_LOCK = "/tmp/relay-protocol-sync.lock"
 # Grey hint text that agents show in an empty prompt box. When reading the
 # prompt box from a screenshot, these do not count as someone's draft.
 PLACEHOLDERS = (
@@ -821,11 +892,12 @@ def resolve_sender(sender, self_window, pids):
     return self_agent(pids) or sender or "unknown"
 
 
-def enqueue(target, message, wake=False, sender=None):
+def enqueue(target, message, wake=False, sender=None, private=False):
     """From the sandbox: queue a message for the host service to deliver.
 
     target: a seat name, or "*" for everyone. wake=True means "type it into
-    the window too", False means a quiet note (file only).
+    the window too", False means a quiet note (file only). private=True
+    keeps it out of the public GitHub repo.
     """
     origin = seat_name(sender) or self_agent(ancestors()) or "unknown"
     inbox = INBOXES[0]
@@ -834,34 +906,244 @@ def enqueue(target, message, wake=False, sender=None):
     payload = {"from": origin, "to": target, "message": message}
     if wake:
         payload["wake"] = True
+    if private:
+        payload["private"] = True
     path.write_text(json.dumps(payload), encoding="utf-8")
     print(f"queued for {target}")
 
 
-def file_message(sender, recipient, message, quiet=False):
+def file_message(sender, recipient, message, quiet=False, private=False):
     """Write one message permanently into the talk files.
 
     Appends the same JSON line to talk/log.jsonl (everything) and to
-    talk/for-<recipient>.jsonl (that seat's mailbox).
+    talk/for-<recipient>.jsonl (that seat's mailbox). If GitHub sync is set
+    up, it also writes the message as a file into the PUBLIC repo, or the
+    private one when private=True or the text looks like it holds a secret.
+    The caller then pushes it (see push_soon and SECTION 11).
     """
     if recipient not in AGENTS:
         raise ValueError(f"no such agent {recipient}")
     text = str(message).strip()
     if not text:
         raise ValueError("refusing to file an empty message")
-    TALK.mkdir(parents=True, exist_ok=True)
     record = {
+        # id: time in nanoseconds first, so ids sort in sending order; then
+        # machine and process, so two senders can never pick the same id.
+        "id": f"{time.time_ns()}-{HOST}-{os.getpid()}",
+        "host": HOST,
         "from": sender if sender in AGENTS else "unknown",
         "to": recipient,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "message": text,
         "quiet": bool(quiet),
+        "private": keep_private(text, private),
     }
+    append_local(record)
+    export_message(record)
+    print(f"filed for {recipient}", flush=True)
+    return record
+
+
+def note_untyped(agent, ids):
+    """Remember that a note could not be typed into `agent`'s window.
+
+    `ids` maps seat -> message id (from file_seats). The id is added to
+    talk/untyped-<agent>, one per line. The scheduler reminds the agent
+    about these notes as well as quiet ones, so a note that couldn't be
+    typed (say, because someone was mid-sentence in that window) is never
+    silently missed.
+    """
+    message_id = ids.get(agent)
+    if agent not in NUDGED or not message_id:
+        return
+    TALK.mkdir(parents=True, exist_ok=True)
+    with open(TALK / f"untyped-{agent}", "a", encoding="utf-8") as handle:
+        handle.write(message_id + "\n")
+
+
+def looks_secret(text):
+    """True if `text` matches any SECRET_PATTERNS (a password, key, token or code)."""
+    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+
+
+def keep_private(text, private):
+    """Decide whether a note must stay out of the public repo.
+
+    True if the sender asked (--private), or if the text looks like it
+    contains a secret, in which case it warns so the sender knows why.
+    """
+    if private:
+        return True
+    if looks_secret(text):
+        print("this looks like it contains a password, key, token or code: "
+              "keeping it in the PRIVATE repo, not the public one", file=sys.stderr, flush=True)
+        return True
+    return False
+
+
+def repo_for(private):
+    """The git clone a note should be written to, or None if there is none.
+
+    Public notes go to PUBLIC_REPO. Private notes go to SYNC_REPO, and are
+    never put in the public repo, even if the private clone is missing. A
+    public note falls back to the private clone if there is no public one.
+    """
+    public, secret = PUBLIC_REPO, SYNC_REPO
+    if not private and (public / ".git").exists():
+        return public
+    if (secret / ".git").exists():
+        return secret
+    return None
+
+
+def sync_repos():
+    """Every git clone that exists on this machine (public first)."""
+    return [repo for repo in (PUBLIC_REPO, SYNC_REPO) if (repo / ".git").exists()]
+
+
+def append_local(record):
+    """Append one message record to this machine's talk files.
+
+    Used both for messages sent here (file_message) and for messages
+    copied in from other machines (import_remote).
+    """
+    TALK.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False) + "\n"
-    for name in ("log.jsonl", f"for-{recipient}.jsonl"):
+    for name in ("log.jsonl", f"for-{record['to']}.jsonl"):
         with open(TALK / name, "a", encoding="utf-8") as handle:
             handle.write(line)
-    print(f"filed for {recipient}", flush=True)
+
+
+def message_text(record):
+    """Turn a message record into the plain-text form stored on GitHub.
+
+    Example:
+        From: claude
+        To: codex
+        Time: 2026-11-20 23:30:00
+        Machine: boop
+        Quiet: no
+        Visibility: public
+        Id: 1795216185912303790-boop-4242
+
+        The message itself, exactly as sent.
+
+    Header lines first, one blank line, then the message.
+    """
+    return "\n".join([
+        f"From: {record['from']}",
+        f"To: {record['to']}",
+        f"Time: {record['ts'].replace('T', ' ')}",
+        f"Machine: {record['host']}",
+        f"Quiet: {'yes' if record['quiet'] else 'no'}",
+        f"Visibility: {'private' if record.get('private') else 'public'}",
+        f"Id: {record['id']}",
+        "",
+        record["message"],
+        "",
+    ])
+
+
+def parse_message_text(text):
+    """Read the plain-text form back into a record (the reverse of message_text).
+
+    Returns None if the text does not look like a message.
+    """
+    head, blank, body = text.partition("\n\n")
+    if not blank:
+        return None
+    fields = {}
+    for line in head.splitlines():
+        key, colon, value = line.partition(":")
+        if colon:
+            fields[key.strip().lower()] = value.strip()
+    if not fields.get("id") or not fields.get("to"):
+        return None
+    return {
+        "id": fields["id"],
+        "host": fields.get("machine", ""),
+        "from": fields.get("from", "unknown"),
+        "to": fields["to"],
+        "ts": fields.get("time", "").replace(" ", "T"),
+        "message": body.rstrip("\n"),
+        "quiet": fields.get("quiet", "no") == "yes",
+        "private": fields.get("visibility", "private") != "public",
+    }
+
+
+def export_message(record):
+    """Write one message into the GitHub repo folder as plain text, if sync is set up.
+
+    File: <repo>/messages/<YYYY-MM-DD>/<HHMMSS>-<from>-to-<to>-<id>.txt
+    where <repo> is the public clone, or the private one (see repo_for)
+    so a person browsing GitHub sees, per day, who wrote to whom and when.
+    One file per message means two machines never edit the same file, so
+    git never has a merge conflict. This only writes to disk; sync_once()
+    commits and pushes. A failure is reported but never stops the message
+    being filed locally.
+    """
+    repo = repo_for(record.get("private"))
+    if repo is None:
+        return
+    try:
+        folder = repo / "messages" / record["ts"][:10]
+        folder.mkdir(parents=True, exist_ok=True)
+        clock = record["ts"][11:19].replace(":", "")
+        name = f"{clock}-{record['from']}-to-{record['to']}-{record['id']}.txt"
+        (folder / name).write_text(message_text(record), encoding="utf-8")
+    except OSError as error:
+        print(f"not copied to the GitHub folder: {error}", file=sys.stderr, flush=True)
+
+
+def add_commentary(author, text, private=False):
+    """Add one entry to today's running commentary, then push it.
+
+    The commentary sits beside the messages: <repo>/commentary/<date>.md,
+    in the PUBLIC repo by default, or the private one with --private (or
+    when the text looks like it holds a secret).
+    It is a play-by-play of WHY things were done: the reasoning, the design
+    choices, what was tried, what comes next. Any agent can add to it with
+        relay-protocol --note "what I did and why"
+    Each entry looks like:
+        ### 23:40:12 · claude (boop)
+        what I did and why
+    Several machines may add to the same day's file. The repo's
+    .gitattributes marks these files `merge=union`, which tells git to keep
+    both sides' additions instead of reporting a conflict.
+    """
+    text = str(text).strip()
+    if not text:
+        raise SystemExit("refusing an empty commentary entry")
+    repo = repo_for(keep_private(text, private))
+    if repo is None:
+        raise SystemExit(f"no commentary: neither {PUBLIC_REPO} nor {SYNC_REPO} is a git clone")
+    folder = repo / "commentary"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{time.strftime('%Y-%m-%d')}.md"
+    if not path.exists():
+        path.write_text(f"# Commentary for {time.strftime('%Y-%m-%d')}\n", encoding="utf-8")
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"\n### {time.strftime('%H:%M:%S')} · {author} ({HOST})\n\n{text}\n")
+    git(repo, "add", "commentary", timeout=30)
+    print(f"added to {repo.name}/{path.relative_to(repo)}", flush=True)
+    push_soon()
+
+
+def push_soon():
+    """Push to GitHub straight away, without making the sender wait.
+
+    Starts `relay-protocol --sync` as a separate background process, so a
+    slow connection never delays the message being typed. If a sync is
+    already running, that one picks the message up (see SYNC_LOCK).
+    """
+    if not sync_repos():
+        return
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--sync"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def read_unread(agent):
@@ -1215,13 +1497,136 @@ def nudge_unread():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 11: The background service loop (`relay-protocol --serve`)
+# SECTION 11: Sharing messages and commentary through GitHub
+# The goal: an agent on any machine can read what the agents said on every
+# other machine, so work can continue anywhere.
+#
+#   1. file_message() writes each new message as a file in the PUBLIC repo
+#      (or the PRIVATE one, for --private notes and anything that looks
+#      like a secret; see repo_for and SECRET_PATTERNS).
+#   2. Sending pushes straight away (push_soon), and every SYNC_EVERY
+#      seconds the service runs sync_once() on both repos:
+#        commit new message files -> pull others' -> push ours
+#   3. import_remote() copies messages that came from OTHER machines into
+#      the local talk files, so `relay-protocol --read` and the unread-note
+#      nudge see them too. They are copied as quiet notes: the other
+#      machine could not type them into a window here.
+#
+# Sync runs in its own thread, so a slow internet connection never holds up
+# local delivery. If GitHub can't be reached, messages wait in the clone and
+# go out on a later try. Nothing is lost.
+# Run one sync by hand with:  relay-protocol --sync
 # -----------------------------------------------------------------------------
 
-def file_seats(sender, seats, message, quiet):
-    """File the same message for each seat in `seats`."""
-    for seat in seats:
-        file_message(sender, seat, message, quiet=quiet)
+def git(repo, *args, timeout=120, check=True):
+    """Run a git command inside the clone `repo`. Never asks for a password."""
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=check,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+
+
+def sync_once():
+    """Commit new message files, pull other machines' messages, push ours.
+
+    Returns how many messages from other machines were copied in, or 0 if
+    another sync is already running (that one will do the work). Raises if
+    git fails (the caller reports it and tries again later).
+    """
+    repos = sync_repos()
+    if not repos:
+        raise RuntimeError(f"sync is off: neither {PUBLIC_REPO} nor {SYNC_REPO} is a git clone")
+    # Only one sync at a time: two gits in one folder would trip over each other.
+    lock_file = open(SYNC_LOCK, "a")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return 0
+    try:
+        for repo in repos:
+            git(repo, "add", "messages", "commentary", timeout=30)
+            # `diff --cached --quiet` exits 1 when something is staged.
+            if git(repo, "diff", "--cached", "--quiet", timeout=30, check=False).returncode == 1:
+                git(repo, "commit", "-q", "-m", f"relay messages from {HOST}", timeout=30)
+            # --rebase puts our new commits on top of everyone else's. Each
+            # message is its own new file, so this cannot conflict.
+            # "origin HEAD" names GitHub and this branch explicitly, so this works
+            # even in a clone that was never linked to a branch on GitHub.
+            git(repo, "pull", "-q", "--rebase", "origin", "HEAD")
+            git(repo, "push", "-q", "origin", "HEAD")
+        return import_remote()
+    finally:
+        lock_file.close()
+
+
+def import_remote():
+    """Copy messages written on OTHER machines into this machine's talk files.
+
+    Skips messages from this machine (they are already local) and ones
+    already copied (listed in IMPORTED). Files are handled in id order,
+    which is sending order. Returns how many were copied.
+    """
+    seen = set()
+    if IMPORTED.exists():
+        seen = set(IMPORTED.read_text(encoding="utf-8").split())
+    added = []
+    copied = 0
+    # Both repos together, sorted by day folder, then by file name (which
+    # starts with the time), so messages are copied in roughly sending order.
+    files = [path for repo in sync_repos() for path in (repo / "messages").glob("*/*.txt")]
+    for path in sorted(files, key=lambda path: (path.parent.name, path.name)):
+        try:
+            record = parse_message_text(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable file: skip it, try again next sync
+        if record is None or record["id"] in seen:
+            continue
+        if record["host"] != HOST and record["to"] in AGENTS and record["message"]:
+            # Marked quiet so the nudge reminds the recipient to --read it.
+            append_local({**record, "quiet": True, "via": "github"})
+            copied += 1
+        added.append(record["id"])
+    if added:
+        TALK.mkdir(parents=True, exist_ok=True)
+        with open(IMPORTED, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(added) + "\n")
+    return copied
+
+
+def sync_forever():
+    """The sync thread started by serve(): run sync_once() every SYNC_EVERY seconds."""
+    reported = None
+    while True:
+        try:
+            count = sync_once()
+            if count:
+                print(f"synced: {count} message(s) from other machines", flush=True)
+            reported = None
+        except Exception as error:  # report a problem once, not every 30 s
+            text = str(getattr(error, "stderr", "") or error).strip()
+            if text != reported:
+                print(f"sync waiting: {text}", file=sys.stderr, flush=True)
+                reported = text
+        time.sleep(SYNC_EVERY)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 12: The background service loop (`relay-protocol --serve`)
+# -----------------------------------------------------------------------------
+
+def file_seats(sender, seats, message, quiet, private=False):
+    """File the same message for each seat in `seats`.
+
+    Returns {seat: message id}, so a failure to type can be recorded
+    against the right note (see note_untyped).
+    """
+    return {seat: file_message(sender, seat, message, quiet=quiet, private=private)["id"]
+            for seat in seats}
 
 
 def serve(args):
@@ -1232,6 +1637,13 @@ def serve(args):
     in place and retried on the next pass; one that succeeds is deleted.
     """
     print("serving the relay-protocol inbox", flush=True)
+    # GitHub sync runs alongside, in its own thread (SECTION 11).
+    # daemon=True: it stops when the service stops.
+    if sync_repos():
+        threading.Thread(target=sync_forever, name="github-sync", daemon=True).start()
+        print("syncing messages with GitHub through " + ", ".join(map(str, sync_repos())), flush=True)
+    else:
+        print(f"GitHub sync off: neither {PUBLIC_REPO} nor {SYNC_REPO} is a git clone", flush=True)
     waiting = False
     while True:
         ensure_agents()
@@ -1270,7 +1682,8 @@ def serve(args):
                             seats = [recipient]
                         else:
                             raise RuntimeError(f"no such agent {recipient}")
-                        file_seats(sender, seats, message, quiet=not data.get("wake"))
+                        data["ids"] = file_seats(sender, seats, message, quiet=not data.get("wake"), private=bool(data.get("private")))
+                        push_soon()  # send it to GitHub now, in the background
                         data["filed"] = True
                         path.write_text(json.dumps(data), encoding="utf-8")
                     # Step 2: if it is not a quiet note, type it into the receiving window(s).
@@ -1287,6 +1700,7 @@ def serve(args):
                                 type_into(window, typed_body(window, message, sender, seat), "auto", False)
                             except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                                 print(f"not typed into {window.get('agent')}: {error}", flush=True)
+                                note_untyped(window.get("agent"), data.get("ids") or {})
             # Something went wrong (for example the window is not open): keep the file
             # in the inbox and try again on the next loop. Only log the error once.
             except Exception as error:
@@ -1301,7 +1715,7 @@ def serve(args):
 
 
 # -----------------------------------------------------------------------------
-# SECTION 12: Command-line entry point - what happens for each flag
+# SECTION 13: Command-line entry point - what happens for each flag
 # -----------------------------------------------------------------------------
 
 def show_list(windows, self_window):
@@ -1341,7 +1755,22 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="file the message only, do not type it into the other window")
     parser.add_argument("--wake", action="store_true", help="type the message into the other window (this is already the default)")
     parser.add_argument("--all", action="store_true", help="file it for every other seat and type it into each open window")
+    parser.add_argument("--sync", action="store_true", help="push and pull messages with GitHub once, then exit")
+    parser.add_argument("--note", metavar="TEXT", help="add a reasoning entry to today's shared commentary on GitHub")
+    parser.add_argument("--private", action="store_true", help="keep this note or --note out of the PUBLIC GitHub repo (it goes to the private one)")
     args = parser.parse_args()
+
+    # --note: add to the running commentary (why things were done).
+    if args.note:
+        author = resolve_sender(args.sender, None, ancestors())
+        add_commentary(author, args.note, private=args.private)
+        return
+
+    # --sync: one GitHub sync by hand (the service does this every 30 s).
+    if args.sync:
+        count = sync_once()
+        print(f"synced with GitHub; {count} new message(s) from other machines")
+        return
 
     # --serve: become the background service and never return.
     if args.serve:
@@ -1353,6 +1782,15 @@ def main():
         agent = args.to or self_agent(ancestors()) or args.sender
         if agent not in AGENTS:
             raise SystemExit(WHICH)
+        # GitHub first: pull the shared record before reading, so notes
+        # sent from other machines show up. If GitHub can't be reached,
+        # say so and read what is already here.
+        if sync_repos():
+            try:
+                sync_once()
+            except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+                detail = str(getattr(error, "stderr", "") or error).strip()
+                print(f"(could not reach GitHub, showing local notes only: {detail})")
         read_unread(agent)
         return
 
@@ -1398,7 +1836,7 @@ def main():
             target_name = args.to or PAIR.get(origin or "")
             if target_name not in AGENTS:
                 raise SystemExit(WHICH)
-        enqueue(target_name, message, wake=not args.quiet, sender=args.sender)
+        enqueue(target_name, message, wake=not args.quiet, sender=args.sender, private=args.private)
         return
 
     if args.all and args.to:
@@ -1441,13 +1879,15 @@ def main():
         raise SystemExit("refusing to send an empty message")
     submit = "none" if args.no_send else args.submit
     # File it first (permanent record), then type it unless --quiet.
-    file_seats(origin, seats, message, quiet=args.quiet)
+    ids = file_seats(origin, seats, message, quiet=args.quiet, private=args.private)
+    push_soon()  # send it to GitHub now, in the background
     if not args.quiet:
         for target in targets:
             try:
                 type_into(target, typed_body(target, message, origin, seat), submit, args.force)
             except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                 print(f"not typed into {target.get('agent')}: {error}", flush=True)
+                note_untyped(target.get("agent"), ids)  # the scheduler will remind them
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+# relay-scheduler: tells agents when new relay notes are waiting.
+# Checks locally every 5 s and GitHub with a doubling back-off (30 s to 15 min).
+# Unlike relay-protocol.service, it never reopens closed agent windows.
+#   install: cp systemd/relay-scheduler.service ~/.config/systemd/user/
+#            systemctl --user daemon-reload
+#   start:   systemctl --user start relay-scheduler.service
+#   log:     journalctl --user -u relay-scheduler -f
+[Unit]
+Description=Tell the agents when new relay notes are waiting (local and GitHub)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/neo/Work
+ExecStart=/home/neo/.local/bin/scheduler
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
