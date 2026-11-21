@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Mirror new public relay files from ~/Work/relay-public to Discord.
+
+Run this beside the GitHub sync scheduler. The scheduler updates the local
+clone; this process forwards newly observed messages and chat records through
+a Discord webhook. Set DISCORD_WEBHOOK_URL locally. The first start records
+the current files as a baseline and does not replay old history.
+"""
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/relay-public"))
+STATE = Path(os.environ.get("DISCORD_RELAY_STATE") or (Path.home() / ".local/state/discord-relay/sent-files.json"))
+AREAS = ("messages", "chat")
+
+
+def public_files():
+    """Return archived public message paths in a stable sending order."""
+    return sorted(path for area in AREAS for path in (REPO / area).glob("*/*.txt"))
+
+
+def contains_private_pattern(text):
+    """Last-resort filter for credential, sign-in-code and contact-shaped text."""
+    import re
+    patterns = (
+        r"\b(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        r"\bsk-[A-Za-z0-9_-]{20,}", r"\bxai-[A-Za-z0-9]{20,}",
+        r"\bAKIA[0-9A-Z]{16}\b", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b",
+        r"(?i)\b(password|passwd|passphrase|api[_ -]?key|secret|token)\s*[:=]\s*\S+",
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def send(webhook, relative_path, text):
+    """Post one public archive file, split into Discord-sized messages."""
+    content = f"**{relative_path}**\n{text.strip()}"
+    for start in range(0, len(content), 1900):
+        payload = json.dumps({"content": content[start:start + 1900]}).encode("utf-8")
+        request = urllib.request.Request(
+            webhook, data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "relay-protocol-discord/1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+
+
+def save_state(sent):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sorted(sent)), encoding="utf-8")
+    temporary.replace(STATE)
+
+
+def main():
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    parsed = urllib.parse.urlsplit(webhook)
+    if parsed.scheme != "https" or parsed.hostname not in ("discord.com", "discordapp.com") or not parsed.path.startswith("/api/webhooks/"):
+        raise SystemExit("discord-relay: configure DISCORD_WEBHOOK_URL locally as a Discord webhook")
+    if not REPO.is_dir():
+        raise SystemExit(f"discord-relay: public relay clone not found: {REPO}")
+    if STATE.exists():
+        try:
+            sent = set(json.loads(STATE.read_text(encoding="utf-8")))
+        except (ValueError, OSError):
+            raise SystemExit(f"discord-relay: unreadable state file: {STATE}")
+    else:
+        sent = {str(path.relative_to(REPO)) for path in public_files()}
+        save_state(sent)
+        print(f"discord-relay: baseline saved ({len(sent)} existing public files)", flush=True)
+    print("discord-relay: watching public relay clone for new messages", flush=True)
+    while True:
+        for path in public_files():
+            relative = str(path.relative_to(REPO))
+            if relative in sent:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+                if contains_private_pattern(text):
+                    print(f"discord-relay: skipped private-pattern file {relative}", flush=True)
+                else:
+                    send(webhook, relative, text)
+                    print(f"discord-relay: posted {relative}", flush=True)
+                sent.add(relative)
+                save_state(sent)
+            except (OSError, urllib.error.URLError, TimeoutError) as error:
+                print(f"discord-relay: delivery failed for {relative}; will retry: {error}", flush=True)
+                break
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
+
+# Written by: Codex
