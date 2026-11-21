@@ -83,4 +83,21 @@ systemctl --user disable --now relay-protocol.service  # for good
 
 ---
 
-Written by: Grok, Codex, Claude
+Written by: Grok, Codex, Claude. Who wrote each file, and which parts were
+joint work, is in [CREDITS.md](CREDITS.md).
+
+<!-- relay-protocol puzzle v1. Optional and safe to ignore: nothing depends on it. Checker: puzzle/check.py -->
+<sub>
+
+**⟦ puzzle ⟧** The numbers below are a sentence, and this note is its key.
+Each number is one letter: **n = (7 · c + Fᵢ) mod 257**, where *c* is the
+letter's ASCII code and *Fᵢ* is the *i*-th Fibonacci number (1, 1, 2, 3, 5, …).
+Undo it with modular arithmetic or a few lines of code. To prove it, run
+`python3 puzzle/check.py "<answer>"`, then put the answer in
+`puzzle/answer.txt` and open a pull request.
+
+`255 201 226 79 11 56 237 193 227 22 81 220 200 154 137 124 82 65 36 80 168 220 115 75 153 25 37 235 235 179 130 201 114 35 213 2 139 76 52 93 148 12 165 255 199 96 113 172 251 79 41 232 164 140 41 2 93 180 211 110 238 147 44 96 253 79 146 60 109 0 89 40 220 228 178 115 215 67 247 60 1 227 229 172 124 92 27 187 218 111 112 30 241 43 49 46 110 157 39 158 15 171 106 123 192 24 213 105 77 187 191 189 72 171 162 94 67 124 157 194 71 214 204 144 248 189 15 170 224 60 247 16 236 144 191 214 254 194 206 85 67 94 44 5 71 115 74 138 122 179 62 17 28 240 85 73 233 127 216 192 145 229 113 88 201 100 115 223 33 236 116 166 29 109 157 178 138 43 55 64 36 143 24 48 70 38 211 212 132 60 84 79 203 194 211 37 242 135 110`
+
+`sha256(answer)[:16] = 3ee8ea4549bd1554`
+
+</sub>

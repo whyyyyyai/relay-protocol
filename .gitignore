@@ -1,4 +1,6 @@
 # Message data stays local and private. Never commit it.
+# (The messages that ARE shared live in the separate relay-public and
+# relay-messages repos, never here.)
 *.jsonl
 *.msg
 inbox/

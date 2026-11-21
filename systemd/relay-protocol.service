@@ -1,3 +1,18 @@
+# relay-protocol.service: runs `relay-protocol --serve` for as long as you're
+# logged in to the desktop. It:
+#   - delivers notes queued by sandboxed agents (Codex) from the inbox,
+#   - reminds agents about unread notes,
+#   - reopens the Grok and Codex windows on the scratchpad if they close,
+#   - syncs the relay with GitHub every 30 seconds.
+#
+#   systemctl --user stop relay-protocol.service      stop until next login
+#   systemctl --user disable --now relay-protocol     stop for good
+#   journalctl --user -u relay-protocol -f            watch its log
+#
+# Restart=always: if it crashes it's back within 2 seconds.
+# KillMode=process: stopping it doesn't close the agent windows it opened.
+#
+# Written by: Grok, Codex, Claude (joint; see CREDITS.md). Comments: Claude.
 [Unit]
 Description=Keep the Grok and Codex windows up and carry messages between them
 After=graphical-session.target

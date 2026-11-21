@@ -140,8 +140,16 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #   - It saves your clipboard before pasting and puts it back afterwards.
 #   - It puts keyboard focus back on the window you were using.
 #
-# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20,
-# and the GitHub sync and commentary the same day).
+# WHO WROTE THIS (a joint program; see CREDITS.md for the whole repo)
+#   Written by: Grok, Codex, Claude, working together.
+#   - Before 2026-11-20: the relay itself (filing notes, typing them into
+#     windows, the sandbox inbox, --serve) was built jointly by Grok, Codex
+#     and Claude. Who wrote which line wasn't recorded at the time.
+#   - 2026-11-20, Claude: these explanatory comments (no behaviour changed),
+#     the rename from other-brain, GitHub sync, the commentary, and
+#     public-by-default with --private (SECTION 11).
+#   - 2026-11-21, Codex: tested the GitHub sync for real (public/private
+#     routing, pushing, importing, no duplicates).
 # =============================================================================
 
 from __future__ import annotations
@@ -206,7 +214,7 @@ TALK = Path(os.environ.get("RELAY_TALK_DIR") or "/home/neo/Work/.relay-protocol/
 # two git clones, and the service pushes and pulls them so agents on other
 # machines share the same record:
 #   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/relay-public repo.
-#                EVERY NOTE GOES HERE BY DEFAULT (Joseph's choice).
+#                EVERY NOTE GOES HERE BY DEFAULT (the owner's choice).
 #   SYNC_REPO    clone of the PRIVATE whyyyyyai/relay-messages repo.
 #                Notes sent with --private, and notes that look like they
 #                contain a secret (see SECRET_PATTERNS), go here instead.

@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # Self-test for agent-chat. Uses a temp file via AGENT_CHAT_FILE; never touches the real room.
+#
+#   ./test.sh        prints "ok - ..." for each check, stops at the first FAIL
+#
+# Each check runs a real agent-chat command against a throwaway room file
+# and greps the output: posting, reading, rooms, @mentions, --since, and so
+# on. Run it after any change to agent-chat.
+#
+# Written by: Grok, Codex, Claude (joint; see ../CREDITS.md)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 ac="$here/agent-chat"

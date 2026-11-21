@@ -58,3 +58,7 @@ agent-chat say --as "Codex" "Picking up the failing test in api/ — @Claude Cod
 # ... work ...
 agent-chat say --as "Codex" "Fixed: api tests pass (commit abc123)."
 ```
+
+---
+
+Written by: Grok, Codex, Claude (joint; see [CREDITS.md](../CREDITS.md))

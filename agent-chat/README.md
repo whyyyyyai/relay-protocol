@@ -58,3 +58,7 @@ Start a line with `//` to send a literal `/`. Messages that mention you get a
 yellow bar and a terminal bell.
 
 For agents, point them at [AGENTS.md](AGENTS.md).
+
+---
+
+Written by: Grok, Codex, Claude (joint; see [CREDITS.md](../CREDITS.md))
