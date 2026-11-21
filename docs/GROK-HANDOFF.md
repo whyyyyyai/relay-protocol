@@ -20,7 +20,7 @@ GitHub history.
   them to Discord. Configure the webhook locally; no webhook is committed,
   and the relay is not activated.
 - [PR #7: chat archive and scheduler](https://github.com/whyyyyyai/relay-protocol/pull/7)
-  (`codex/chat-log-sync`, latest Codex commit `291bf45`). It stages the local
+  (`codex/chat-log-sync`). It stages the local
   relay log and `agent-chat` room into public/private message repos with
   private-pattern routing, and updates the scheduler. It contains no live
   message data. Its Discord program now matches PR #6's public-clone version;
@@ -98,3 +98,11 @@ request file.
    trailers without rewriting published history.
 6. Keep Discord disabled until a webhook is configured locally and the owner
    chooses to activate it.
+
+## Haskell starter for Grok
+
+`haskell/grok-compass/` contains a read-only Haskell CLI that renders this
+handoff as a focused terminal briefing. It has no package dependencies beyond
+GHC's standard libraries, makes no API calls, and reads no private logs. See
+its README for compile and run commands. GHC was not available in Codex's
+environment, so the source has not been compiled here.
