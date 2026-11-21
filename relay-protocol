@@ -941,6 +941,24 @@ def file_message(sender, recipient, message, quiet=False, private=False):
     append_local(record)
     export_message(record)
     print(f"filed for {recipient}", flush=True)
+    return record
+
+
+def note_untyped(agent, ids):
+    """Remember that a note could not be typed into `agent`'s window.
+
+    `ids` maps seat -> message id (from file_seats). The id is added to
+    talk/untyped-<agent>, one per line. The scheduler reminds the agent
+    about these notes as well as quiet ones, so a note that couldn't be
+    typed (say, because someone was mid-sentence in that window) is never
+    silently missed.
+    """
+    message_id = ids.get(agent)
+    if agent not in NUDGED or not message_id:
+        return
+    TALK.mkdir(parents=True, exist_ok=True)
+    with open(TALK / f"untyped-{agent}", "a", encoding="utf-8") as handle:
+        handle.write(message_id + "\n")
 
 
 def looks_secret(text):
@@ -1537,8 +1555,10 @@ def sync_once():
                 git(repo, "commit", "-q", "-m", f"relay messages from {HOST}", timeout=30)
             # --rebase puts our new commits on top of everyone else's. Each
             # message is its own new file, so this cannot conflict.
-            git(repo, "pull", "-q", "--rebase")
-            git(repo, "push", "-q")
+            # "origin HEAD" names GitHub and this branch explicitly, so this works
+            # even in a clone that was never linked to a branch on GitHub.
+            git(repo, "pull", "-q", "--rebase", "origin", "HEAD")
+            git(repo, "push", "-q", "origin", "HEAD")
         return import_remote()
     finally:
         lock_file.close()
@@ -1600,9 +1620,13 @@ def sync_forever():
 # -----------------------------------------------------------------------------
 
 def file_seats(sender, seats, message, quiet, private=False):
-    """File the same message for each seat in `seats`."""
-    for seat in seats:
-        file_message(sender, seat, message, quiet=quiet, private=private)
+    """File the same message for each seat in `seats`.
+
+    Returns {seat: message id}, so a failure to type can be recorded
+    against the right note (see note_untyped).
+    """
+    return {seat: file_message(sender, seat, message, quiet=quiet, private=private)["id"]
+            for seat in seats}
 
 
 def serve(args):
@@ -1658,7 +1682,7 @@ def serve(args):
                             seats = [recipient]
                         else:
                             raise RuntimeError(f"no such agent {recipient}")
-                        file_seats(sender, seats, message, quiet=not data.get("wake"), private=bool(data.get("private")))
+                        data["ids"] = file_seats(sender, seats, message, quiet=not data.get("wake"), private=bool(data.get("private")))
                         push_soon()  # send it to GitHub now, in the background
                         data["filed"] = True
                         path.write_text(json.dumps(data), encoding="utf-8")
@@ -1676,6 +1700,7 @@ def serve(args):
                                 type_into(window, typed_body(window, message, sender, seat), "auto", False)
                             except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                                 print(f"not typed into {window.get('agent')}: {error}", flush=True)
+                                note_untyped(window.get("agent"), data.get("ids") or {})
             # Something went wrong (for example the window is not open): keep the file
             # in the inbox and try again on the next loop. Only log the error once.
             except Exception as error:
@@ -1854,7 +1879,7 @@ def main():
         raise SystemExit("refusing to send an empty message")
     submit = "none" if args.no_send else args.submit
     # File it first (permanent record), then type it unless --quiet.
-    file_seats(origin, seats, message, quiet=args.quiet, private=args.private)
+    ids = file_seats(origin, seats, message, quiet=args.quiet, private=args.private)
     push_soon()  # send it to GitHub now, in the background
     if not args.quiet:
         for target in targets:
@@ -1862,6 +1887,7 @@ def main():
                 type_into(target, typed_body(target, message, origin, seat), submit, args.force)
             except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                 print(f"not typed into {target.get('agent')}: {error}", flush=True)
+                note_untyped(target.get("agent"), ids)  # the scheduler will remind them
 
 
 if __name__ == "__main__":
