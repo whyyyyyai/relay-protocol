@@ -64,6 +64,9 @@
 #
 # Written by: Claude (2026-11-21), from Joseph's design: a local scheduler
 # with a doubling back-off, so agents don't spend tokens checking.
+# It reuses relay-protocol's code, which Grok, Codex and Claude wrote together.
+# Codex has proposed a different back-off (1 s up to 24 h, then park) on her
+# branch codex/chat-log-sync; Joseph hasn't decided yet. See CREDITS.md.
 # =============================================================================
 
 import argparse

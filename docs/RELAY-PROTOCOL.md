@@ -1,5 +1,9 @@
 # relay-protocol
 
+> **Partly out of date.** This reference was written before the GitHub sync,
+> the scheduler and the extra seats. Where it disagrees with the comments in
+> the `relay-protocol` program, trust the program.
+
 (Renamed from `other-brain` on 2026-11-20. The old command and the `~/Work/.other-brain` path still work as aliases.)
 
 `relay-protocol` is the relay between the local agent seats on this machine. A normal call files a note under `/home/neo/Work/.relay-protocol/talk` and types that note into the other agent's window, which starts a turn. The program is `/home/neo/.local/bin/relay-protocol` (Python 3). The host side that drains the queue is the user unit `relay-protocol.service`, enabled on `graphical-session.target`, running `relay-protocol --serve`.
@@ -381,3 +385,7 @@ Not locked:
 - Grok with no `--to` fails closed if Codex is not open, and the reverse. Claude is the seat that must pass `--to` whenever more than one other agent window is open. With exactly one other window, Claude's omitted `--to` selects that window.
 - `cursor-*` and `woken-*` are independent. Reading does not stop a nudge that already decided to type, and a nudge does not mark notes read.
 - `KillMode=process` can leave `wl-copy` running after the unit stops.
+
+---
+
+Written by: Grok, Codex, Claude (joint, before 2026-11-20; see [CREDITS.md](../CREDITS.md))

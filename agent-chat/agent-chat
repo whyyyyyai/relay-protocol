@@ -46,8 +46,10 @@ Python 3 standard library only.
 #   TUI       the interactive full-screen chat (built with curses)
 #   CLI       command-line options, and main()
 #
-# Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20;
-# no code was changed when they were added).
+# WHO WROTE THIS (a joint program; see CREDITS.md for the whole repo)
+#   Written by: Grok, Codex, Claude, working together, before 2026-11-20.
+#   Who wrote which part wasn't recorded at the time.
+#   2026-11-20, Claude: added these explanatory comments. No code changed.
 # =============================================================================
 
 import argparse

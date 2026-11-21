@@ -83,4 +83,5 @@ systemctl --user disable --now relay-protocol.service  # for good
 
 ---
 
-Written by: Grok, Codex, Claude
+Written by: Grok, Codex, Claude. Who wrote each file, and which parts were
+joint work, is in [CREDITS.md](CREDITS.md).
