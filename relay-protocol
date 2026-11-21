@@ -142,6 +142,8 @@ prints notes waiting in the file. --notify is a desktop notice for Neo.
 #
 # Written by: Grok, Codex, Claude (Claude added these comments on 2026-11-20,
 # and the GitHub sync and commentary the same day).
+# Updated by: Codex (2026-11-21): email-shaped content privacy routing and
+# chat archive sync staging.
 # =============================================================================
 
 from __future__ import annotations

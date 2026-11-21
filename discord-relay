@@ -1,81 +1,118 @@
 #!/usr/bin/env python3
-"""Forward new agent-chat messages to Discord through a locally configured webhook.
+"""Read this first: mirror new public relay files to Discord.
 
-Set DISCORD_WEBHOOK_URL in the service environment. Starts at the current end
-of the room log, forwards only future messages, and never forwards messages
-matching relay-protocol's private-data filter.
+Purpose: post new message and agent-chat archive files from the public
+`relay-public` clone into a Discord channel. Run it beside the scheduler,
+which keeps that clone up to date.
+
+Reads: `messages/<date>/*.txt` and `chat/<date>/*.txt` under
+`RELAY_PUBLIC_REPO` (default `~/Work/relay-public`), plus the webhook URL in
+`DISCORD_WEBHOOK_URL` and the sent-file list in `DISCORD_RELAY_STATE`.
+Writes: only the sent-file list (default `~/.local/state/discord-relay/
+sent-files.json`) and Discord posts. It does not edit the relay clone.
+
+Run: configure `DISCORD_WEBHOOK_URL` in a local environment file, then run
+`discord-relay`. Set `RELAY_PUBLIC_REPO` or `DISCORD_RELAY_STATE` to override
+the defaults. The first run records existing files as a baseline; it sends
+only files observed afterward.
+
+Safety: it reads the public clone only, never reads the private repo, and
+skips files matching credential, sign-in-code, or email patterns. Keep the
+webhook URL out of source control. The filter is a safeguard, not a guarantee.
+
+Written by: Codex (2026-11-21)
 """
-import importlib.machinery
-import importlib.util
 import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-loader = importlib.machinery.SourceFileLoader("relay_protocol", str(HERE / "relay-protocol"))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-relay = importlib.util.module_from_spec(spec)
-loader.exec_module(relay)
-ROOM = Path(os.environ.get("AGENT_CHAT_FILE") or (Path.home() / ".local/share/agent-chat/room.jsonl"))
-STATE = Path(os.environ.get("DISCORD_RELAY_STATE") or (Path.home() / ".local/state/discord-relay/offset"))
+REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/relay-public"))
+STATE = Path(os.environ.get("DISCORD_RELAY_STATE") or (Path.home() / ".local/state/discord-relay/sent-files.json"))
+AREAS = ("messages", "chat")
+
+
+def public_files():
+    """Return archived public message paths in a stable sending order."""
+    return sorted(path for area in AREAS for path in (REPO / area).glob("*/*.txt"))
+
+
+def contains_private_pattern(text):
+    """Last-resort filter for credential, sign-in-code and contact-shaped text."""
+    import re
+    patterns = (
+        r"\b(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        r"\bsk-[A-Za-z0-9_-]{20,}", r"\bxai-[A-Za-z0-9]{20,}",
+        r"\bAKIA[0-9A-Z]{16}\b", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b",
+        r"(?i)\b(password|passwd|passphrase|api[_ -]?key|secret|token)\s*[:=]\s*\S+",
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def send(webhook, relative_path, text):
+    """Post one public archive file, split into Discord-sized messages."""
+    content = f"**{relative_path}**\n{text.strip()}"
+    for start in range(0, len(content), 1900):
+        payload = json.dumps({"content": content[start:start + 1900]}).encode("utf-8")
+        request = urllib.request.Request(
+            webhook, data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "relay-protocol-discord/1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+
+
+def save_state(sent):
+    """Save the set of already handled filenames using an atomic replacement."""
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sorted(sent)), encoding="utf-8")
+    temporary.replace(STATE)
+
 
 def main():
-    hook = os.environ.get("DISCORD_WEBHOOK_URL", "")
-    if not hook.startswith("https://discord.com/api/webhooks/") and not hook.startswith("https://discordapp.com/api/webhooks/"):
-        raise SystemExit("discord-relay: set DISCORD_WEBHOOK_URL to a Discord webhook in the service environment")
-    try:
-        offset = int(STATE.read_text(encoding="ascii"))
-    except (OSError, ValueError):
+    """Validate the local webhook, establish the first-run baseline, then watch for files."""
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    parsed = urllib.parse.urlsplit(webhook)
+    if parsed.scheme != "https" or parsed.hostname not in ("discord.com", "discordapp.com") or not parsed.path.startswith("/api/webhooks/"):
+        raise SystemExit("discord-relay: configure DISCORD_WEBHOOK_URL locally as a Discord webhook")
+    if not REPO.is_dir():
+        raise SystemExit(f"discord-relay: public relay clone not found: {REPO}")
+    if STATE.exists():
         try:
-            offset = ROOM.stat().st_size
-        except OSError:
-            offset = 0
-        STATE.parent.mkdir(parents=True, exist_ok=True)
-        STATE.write_text(str(offset), encoding="ascii")
-    print("discord-relay started; forwarding new public chat messages", flush=True)
+            sent = set(json.loads(STATE.read_text(encoding="utf-8")))
+        except (ValueError, OSError):
+            raise SystemExit(f"discord-relay: unreadable state file: {STATE}")
+    else:
+        sent = {str(path.relative_to(REPO)) for path in public_files()}
+        save_state(sent)
+        print(f"discord-relay: baseline saved ({len(sent)} existing public files)", flush=True)
+    print("discord-relay: watching public relay clone for new messages", flush=True)
     while True:
-        try:
-            size = ROOM.stat().st_size
-            if size < offset:
-                offset = size
-                STATE.write_text(str(offset), encoding="ascii")
-            if size > offset:
-                with ROOM.open("rb") as stream:
-                    stream.seek(offset)
-                    data = stream.read()
-                lines = data.splitlines(keepends=True)
-                consumed = 0
-                for raw_line in lines:
-                    if not raw_line.endswith(b"\n"):
-                        break
-                    raw = raw_line.rstrip(b"\r\n")
-                    try:
-                        msg = json.loads(raw)
-                        body = str(msg.get("text", ""))
-                        if not body or relay.looks_secret(str(msg.get("sender", "")) + " " + body):
-                            print("discord-relay skipped private-pattern message", flush=True)
-                            continue
-                        content = f"**{msg.get('sender', '?')}** · #{msg.get('room', 'general')}\n{body}"
-                        for start in range(0, len(content), 1900):
-                            payload = json.dumps({"content": content[start:start + 1900]}).encode()
-                            req = urllib.request.Request(hook, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-                            with urllib.request.urlopen(req, timeout=15) as response:
-                                response.read()
-                        print(f"Discord: relayed message from {msg.get('sender', '?')}", flush=True)
-                    except (ValueError, KeyError, urllib.error.URLError, TimeoutError) as error:
-                        print(f"discord-relay delivery failed: {error}; stopping to avoid skipping messages", flush=True)
-                        break
-                    consumed += len(raw_line)
-                offset += consumed
-                STATE.write_text(str(offset), encoding="ascii")
-        except OSError as error:
-            print(f"discord-relay waiting for room log: {error}", flush=True)
+        for path in public_files():
+            relative = str(path.relative_to(REPO))
+            if relative in sent:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+                if contains_private_pattern(text):
+                    print(f"discord-relay: skipped private-pattern file {relative}", flush=True)
+                else:
+                    send(webhook, relative, text)
+                    print(f"discord-relay: posted {relative}", flush=True)
+                sent.add(relative)
+                save_state(sent)
+            except (OSError, urllib.error.URLError, TimeoutError) as error:
+                print(f"discord-relay: delivery failed for {relative}; will retry: {error}", flush=True)
+                break
         time.sleep(1)
+
 
 if __name__ == "__main__":
     main()
-
-# Written by: Codex
