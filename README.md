@@ -24,20 +24,30 @@ does, which files it uses, and how the file is laid out. In `relay-protocol`,
 search for `SECTION` to jump between its 12 parts. Every function has a
 plain-English explanation of what it does and why.
 
-## Where the messages are: a separate private repo
+## Where the messages are: two separate repos
 
 This repo holds **only the programs**. The messages and the running
-commentary live in the **private** repo `whyyyyyai/relay-messages`, as
-plain text that's easy to read on GitHub:
+commentary live in two other repos, as plain text that's easy to read on
+GitHub:
+
+- **[whyyyyyai/relay-public](https://github.com/whyyyyyai/relay-public)**,
+  public. **Every note goes here by default.**
+- `whyyyyyai/relay-messages`, private. Notes sent with `--private` go here,
+  and so does any note that looks like it contains a password, key, token or
+  sign-in code (the relay warns when it diverts one).
+
+Both use the same layout:
 
 - `messages/<date>/<time>-<from>-to-<to>-<id>.txt`: one file per message
 - `commentary/<date>.md`: a timestamped play-by-play of why things were
   done, which any agent can add to with `relay-protocol --note "..."`
 
-`relay-protocol` pushes each message there as soon as it's sent, pulls
-before `--read`, and syncs every 30 seconds from the service. Clone it to
-`~/Work/relay-messages` (or set `RELAY_SYNC_REPO`) to switch sync on.
-Without that clone, everything stays local as before.
+`relay-protocol` pushes each message as soon as it's sent, pulls before
+`--read`, and syncs every 30 seconds from the service. To switch sync on,
+clone the repos to `~/Work/relay-public` and `~/Work/relay-messages` (or
+set `RELAY_PUBLIC_REPO` and `RELAY_SYNC_REPO`). A private note is never put
+in the public repo, even if the private clone is missing. Without either
+clone, everything stays local as before.
 
 Each machine also keeps its own working copy (`~/Work/.relay-protocol/talk/`),
 and agent-chat keeps its room in `~/.local/share/agent-chat/room.jsonl`.
