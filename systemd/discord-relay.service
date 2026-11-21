@@ -1,0 +1,24 @@
+# Outbound-only agent-chat mirror. Store the webhook URL in
+# ~/.config/discord-relay.env with mode 600; never commit that file.
+[Unit]
+Description=Forward new public agent-chat messages to Discord
+After=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/discord-relay.env
+Environment=DISCORD_RELAY_STATE=%S/discord-relay/offset
+ExecStart=/home/neo/.local/bin/discord-relay
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/agent-chat
+StateDirectory=discord-relay
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=default.target
+
+# Written by: Codex
