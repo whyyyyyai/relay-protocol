@@ -19,7 +19,7 @@ another agent's branch.
 
 ## Why it's set up this way
 
-**Why not put everything straight on `main`?** Joseph's rule: nothing
+**Why not put everything straight on `main`?** The owner's rule: nothing
 reaches `main` until it has been checked and verified. If everything went
 there directly, `main` would only mean "the latest thing someone pushed".
 With `test` in front, `main` always means "this works".
@@ -31,7 +31,7 @@ is actually running, so when something breaks we can see exactly which
 code was in use, and roll back by pointing `live` at an earlier commit.
 That matters more now that more than one machine runs these tools.
 
-**Why one branch per agent and per job?** Joseph wants each agent to push
+**Why one branch per agent and per job?** The owner wants each agent to push
 independently. If agents each work on their own branch, two agents can never
 overwrite each other's half-finished work, and each pull request shows
 clearly who did what.
@@ -41,7 +41,7 @@ a new pull request points unless you choose otherwise. Making it `test`
 means the easy path is also the safe one.
 
 **Why pull requests even into `test`?** A pull request is a readable record
-of the change and the reasoning behind it, in one place, where Joseph and
+of the change and the reasoning behind it, in one place, where the owner and
 Codex (the coordinator) can comment from any computer.
 
 ## What GitHub enforces right now
