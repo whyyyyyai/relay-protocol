@@ -1,0 +1,19 @@
+# push-courier: pushes sandboxed agents' own branches (codex/..., grok/...)
+# to GitHub for them, and opens pull requests into test. See the comment at
+# the top of push-courier for the safety rules.
+#
+#   systemctl --user enable --now push-courier.service
+#   journalctl --user -u push-courier -f
+#
+# Written by: Claude (2026-11-21)
+[Unit]
+Description=push-courier: push sandboxed agents' branches to GitHub
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/push-courier
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

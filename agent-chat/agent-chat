@@ -920,7 +920,7 @@ def main(argv=None):
         else:
             parser.print_help()
             return 0
-    # No sub-command given, e.g. `agent-chat --as Joseph`: treat it as the TUI.
+    # No sub-command given, e.g. `agent-chat --as owner`: treat it as the TUI.
     elif argv[0] in ("--as", "--room", "-r") or argv[0].startswith(("--as=", "--room=")):
         argv = ["tui"] + argv  # `agent-chat --as NAME` opens the TUI
     args = parser.parse_args(argv)

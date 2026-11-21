@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""push-courier: push sandboxed agents' git branches to GitHub for them.
+
+  push-courier              run forever (normally as push-courier.service)
+  push-courier --once       handle waiting requests, then exit
+  push-courier --dry-run    check requests and say what would happen; push nothing
+"""
+
+# =============================================================================
+# push-courier: how this program works (read this first)
+# =============================================================================
+#
+# THE PROBLEM IT SOLVES
+#   Codex works inside a sandbox with the network switched off, and it can't
+#   reach the GitHub login stored in the desktop keyring. It can make commits
+#   (the repo folders are writable), but `git push` fails. So its finished
+#   work sits on this machine where nobody else can see or review it.
+#
+#   Rather than opening the sandbox up, this small program runs OUTSIDE it,
+#   as the signed-in user, and does the pushing on the agent's behalf. The
+#   agent stays sandboxed; only the narrow job "push my own branch" gets out.
+#
+# HOW AN AGENT ASKS FOR A PUSH
+#   It writes one small JSON file into ~/Work/.relay-protocol/push/requests/,
+#   for example requests/codex-discord-bot.json:
+#
+#     {"agent": "codex",
+#      "repo": "relay-protocol",
+#      "branch": "codex/discord-bot",
+#      "pr": {"base": "test", "title": "Discord relay", "body": "What and why ..."}}
+#
+#   "pr" is optional. With it, a pull request into `base` is opened as well
+#   (or the existing one is reused).
+#
+#   Within about 5 seconds this program picks the file up, and writes the
+#   answer to ~/Work/.relay-protocol/push/done/<same name>.json:
+#
+#     {"ok": true, "pushed": "codex/discord-bot", "pr": "https://github.com/...",
+#      "detail": "..."}
+#
+#   or {"ok": false, "error": "why it was refused"}. It also tells the agent
+#   through the relay, typed into its window, so it hears straight away.
+#
+# WHAT IT WILL AND WON'T DO (the safety rules)
+#   - Only repos in ~/Work whose GitHub remote belongs to whyyyyyai.
+#   - Only a branch named after the asking agent: codex can push `codex/...`,
+#     grok can push `grok/...`, and so on. Never main, test or live.
+#   - Pull requests may only go into `test`. Getting from test to main, and
+#     main to live, stays a decision for the owner (see docs/BRANCHING.md).
+#   - Never a force push. If GitHub has commits the branch doesn't, it
+#     refuses and says so.
+#   - Before pushing, it scans every line the branch adds for passwords, keys,
+#     tokens and private keys. Any hit and nothing is pushed.
+#   GitHub's own branch protection on main and live is a second lock behind
+#   these rules.
+#
+# Written by: Claude (2026-11-21), so Codex can push its own branches.
+# =============================================================================
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+WORK = Path(os.environ.get("RELAY_WORK_DIR") or (Path.home() / "Work"))
+QUEUE = Path(os.environ.get("PUSH_COURIER_DIR") or (WORK / ".relay-protocol/push"))
+REQUESTS = QUEUE / "requests"
+DONE = QUEUE / "done"
+OWNER = "whyyyyyai"
+AGENTS = ("codex", "grok", "claude", "foot-claude")
+PROTECTED = ("main", "test", "live")
+PR_BASES = ("test",)
+EVERY = 5  # seconds between looks at the requests folder
+
+# Things that must never be pushed. Kept to the unmistakable ones: code is
+# full of words like "token = ..." that aren't secrets.
+SECRETS = [
+    re.compile(r"\b(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bxai-[A-Za-z0-9]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"https://discord(app)?\.com/api/webhooks/\d+/[\w-]+"),
+]
+BRANCH_OK = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$")
+
+
+def log(text):
+    """Print one timestamped line (it ends up in the service log)."""
+    print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+
+
+def run(cwd, *cmd, check=True, timeout=120):
+    """Run a command, return its output. Raises RuntimeError with the reason."""
+    done = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if check and done.returncode != 0:
+        lines = (done.stderr or done.stdout).strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else f"{cmd[0]} {cmd[1]} failed")
+    return done.stdout.strip()
+
+
+def check_request(req):
+    """Apply the safety rules. Returns (repo folder, GitHub name) or raises ValueError."""
+    agent = req.get("agent")
+    repo = req.get("repo")
+    branch = req.get("branch")
+    if agent not in AGENTS:
+        raise ValueError(f"unknown agent {agent!r}")
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", repo) or repo.startswith("."):
+        raise ValueError("repo must be a plain folder name in ~/Work, like relay-protocol")
+    if not isinstance(branch, str) or not BRANCH_OK.match(branch) or ".." in branch:
+        raise ValueError(f"bad branch name {branch!r}")
+    if branch in PROTECTED or not branch.startswith(agent + "/"):
+        raise ValueError(f"{agent} may only push branches named {agent}/..., not {branch!r}")
+    folder = WORK / repo
+    if not (folder / ".git").exists():
+        raise ValueError(f"{folder} is not a git repo")
+    # The address git will REALLY push to, after any rewriting rules. Checked
+    # this way so that an edited .git/config can't send the push elsewhere.
+    push_url = run(folder, "git", "remote", "get-url", "--push", "origin")
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+)/([A-Za-z0-9._-]+?)(?:\.git)?", push_url)
+    test_remote = os.environ.get("PUSH_COURIER_TEST_REMOTE")  # only for the self-test
+    if test_remote and push_url.startswith(test_remote):
+        match = re.fullmatch(r".*/()([A-Za-z0-9._-]+?)(?:\.git)?", push_url)
+    elif not match or match.group(1) != OWNER:
+        raise ValueError(f"{repo} would push to {push_url}, which isn't a {OWNER} repo on GitHub")
+    if not run(folder, "git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
+        raise ValueError(f"there is no branch {branch} in {folder}: commit to it first")
+    pr = req.get("pr")
+    if pr is not None:
+        if not isinstance(pr, dict) or pr.get("base") not in PR_BASES:
+            raise ValueError(f"pull requests may only go into {', '.join(PR_BASES)}")
+        if not str(pr.get("title") or "").strip():
+            raise ValueError("a pull request needs a title")
+    return folder, f"{OWNER}/{match.group(2)}"
+
+
+def scan_for_secrets(folder, branch):
+    """Refuse if any line the branch adds (compared with GitHub's test) looks like a secret."""
+    run(folder, "git", "fetch", "-q", "origin")
+    base = "origin/test" if run(folder, "git", "branch", "-r", "--list", "origin/test") else "origin/HEAD"
+    diff = run(folder, "git", "diff", f"{base}...refs/heads/{branch}")
+    for line in diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            for pattern in SECRETS:
+                if pattern.search(line):
+                    raise ValueError("the branch adds something that looks like a secret "
+                                     f"({pattern.pattern[:30]}...). Remove it, then ask again.")
+
+
+def handle(req, dry_run):
+    """Do one request. Returns the answer dict."""
+    folder, github = check_request(req)
+    branch = req["branch"]
+    scan_for_secrets(folder, branch)
+    if dry_run:
+        return {"ok": True, "dry_run": True, "detail": f"would push {branch} to {github}"}
+    # No force: if GitHub's copy has commits this one lacks, git refuses.
+    try:
+        run(folder, "git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}")
+    except RuntimeError as error:
+        if "fast-forward" in str(error) or "rejected" in str(error):
+            raise RuntimeError(f"GitHub's {branch} has commits yours doesn't (or yours was rewritten). "
+                               "Force pushes aren't allowed: rebase onto origin, or use a new branch name.")
+        raise
+    answer = {"ok": True, "pushed": branch, "repo": github,
+              "commit": run(folder, "git", "rev-parse", "--short", f"refs/heads/{branch}")}
+    pr = req.get("pr")
+    if pr:
+        existing = run(folder, "gh", "pr", "list", "--repo", github, "--head", branch,
+                       "--state", "open", "--json", "url", "--jq", ".[0].url", check=False)
+        if existing:
+            answer["pr"] = existing
+        else:
+            answer["pr"] = run(folder, "gh", "pr", "create", "--repo", github, "--base", pr["base"],
+                               "--head", branch, "--title", pr["title"], "--body", pr.get("body") or "")
+    return answer
+
+
+def tell(agent, answer):
+    """Tell the agent through the relay. It is typed into its window, so it hears at once."""
+    if answer.get("ok"):
+        text = f"push-courier: pushed {answer.get('pushed')} ({answer.get('commit')})"
+        if answer.get("pr"):
+            text += f", pull request {answer['pr']}"
+    else:
+        text = f"push-courier: did not push: {answer.get('error')}"
+    subprocess.run(["relay-protocol", "--from", "claude", "--to", agent, text],
+                   capture_output=True, timeout=60)
+
+
+def handle_waiting(dry_run):
+    """Answer every request file waiting in requests/, oldest name first.
+
+    Each request is moved out once answered: its answer goes to done/, and
+    the agent is told through the relay. A refused request is answered too,
+    with the reason, so the agent never waits on silence.
+    """
+    REQUESTS.mkdir(parents=True, exist_ok=True)
+    DONE.mkdir(parents=True, exist_ok=True)
+    for path in sorted(REQUESTS.glob("*.json")):
+        try:
+            req = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(req, dict):
+                raise ValueError("the request must be a JSON object")
+            answer = handle(req, dry_run)
+        except json.JSONDecodeError as error:
+            req, answer = {}, {"ok": False, "error": f"not valid JSON: {error}"}
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            answer = {"ok": False, "error": str(error)}
+        answer["request"] = req if isinstance(req, dict) else {}
+        answer["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        log(f"{path.name}: {'ok' if answer['ok'] else 'refused'}: "
+            f"{answer.get('pr') or answer.get('pushed') or answer.get('detail') or answer.get('error')}")
+        if dry_run:
+            continue
+        (DONE / path.name).write_text(json.dumps(answer, indent=2) + "\n", encoding="utf-8")
+        path.unlink()
+        if req.get("agent") in AGENTS:
+            tell(req["agent"], answer)
+
+
+def main():
+    """Read the options, then look at the requests folder every EVERY seconds."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--once", action="store_true", help="handle waiting requests, then exit")
+    parser.add_argument("--dry-run", action="store_true", help="check requests, push nothing")
+    args = parser.parse_args()
+    log(f"push-courier watching {REQUESTS}")
+    while True:
+        handle_waiting(args.dry_run)
+        if args.once:
+            return
+        time.sleep(EVERY)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
